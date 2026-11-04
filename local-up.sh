@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Starts the AICL local stack in one gnome-terminal window, one tab per service.
+# Later starts add their tabs to that window while it is still open.
 #
 #   ./local-up.sh                  # pick services from an inline checklist (last pick is remembered)
 #   ./local-up.sh --all            # start everything, no checklist
@@ -7,6 +8,12 @@
 #   ./local-up.sh --no-pull ...    # skip fetching/pulling from origin
 #   ./local-up.sh --no-watch ...   # exit once the tabs are open (skip the live ready table)
 #   ./local-up.sh --stop [names]   # stop running services (all of them when no names are given)
+#   ./local-up.sh --in-terminal ...  # run in a tab of the local-up window (the panel applet uses this)
+#   ./local-up.sh --tunnel [names] # start the dev tunnel (TUNNEL_ID) in a tab, plus any named services
+#   ./local-up.sh --stop-tunnel    # stop the dev tunnel
+#   ./local-up.sh --branches <service>         # list the branches of that service's repo
+#   ./local-up.sh --switch <service> <branch>  # switch that repo (refused while it has uncommitted changes)
+#   ./local-up.sh --fetch|--pull <service>     # fetch, or fetch + fast-forward (+ install if the lockfile changed)
 #   ./local-up.sh --list           # show available service names
 #   ./local-up.sh --help           # show this help and every service with its port
 #
@@ -15,6 +22,7 @@
 # Steps on start:
 #   1. fetch origin for the repos in parallel (the checklist then shows branch, behind/ahead, dirty)
 #   2. check Mongo/Redis/Postgres/Kafka needed by the selection, offer to start them via systemctl
+#      (docker:<container> infra is started with `docker start`; replset runs mongod as a replica set)
 #   3. fast-forward each selected repo on its current branch and log the result
 #   4. npm install / uv sync where a lockfile changed in that pull or deps are missing
 #   5. check the service ports, offer to kill whatever is holding them
@@ -38,6 +46,8 @@ LAST_SELECTION_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/aicl-local-up.last"
 LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/aicl-local-up"
 # <service>.exit holds the exit code of a service whose tab command ended (crash or Ctrl+C)
 EXIT_DIR="$LOG_DIR/exit"
+# <tab>: "screen service" of each tab this script opened, so later starts can add tabs to that window
+SCREEN_DIR="$LOG_DIR/screen"
 READY_TIMEOUT="${READY_TIMEOUT:-240}"
 
 # name | directory (relative to ROOT) | port | URL path | infra it needs | command
@@ -64,7 +74,8 @@ SERVICES=(
 # Unticked in the checklist until you pick them once (after that your last pick is remembered)
 DEFAULT_OFF=(payment-manager agrisphere-api auditor catalyst agrisphere-ui)
 
-# name | port | systemd unit
+# name | port | systemd unit, docker:<container> (started with `docker start`, no sudo), or
+# replset (mongod as replica set MONGO_REPLSET, see start_replset)
 INFRA=(
   "mongo|27017|mongod"
   "redis|6379|redis-server"
@@ -77,6 +88,11 @@ INFRA=(
 # so one person's edit here would conflict with, or once pushed break, everyone else's setup.
 declare -A SERVICE_PORT=() SERVICE_DIR=() INFRA_PORT=() INFRA_UNIT=() PORT_SOURCE=()
 DISABLE_IPV6=true
+# Used by INFRA unit `replset` (form-builder needs Mongo as a replica set)
+MONGO_REPLSET="rs0"
+MONGO_DBPATH="/data/db"
+# Dev tunnel ID for --tunnel (`devtunnel list`); empty = no tunnel
+TUNNEL_ID=""
 LOCAL_OVERRIDES="$ROOT/local-up.local.sh"
 if [[ -f "$LOCAL_OVERRIDES" ]]; then
   # shellcheck disable=SC1090
@@ -134,6 +150,31 @@ trap cleanup EXIT
 is_listening() { [[ -n "$(ss -ltnH "sport = :$1" 2>/dev/null)" ]]; }
 
 listener_pids() { lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | sort -u || true; }
+
+# Anchored so the tab's `bash -c` wrapper, whose command line also contains it, is not matched
+tunnel_pids() { pgrep -u "$USER" -f "^(\S*/)?devtunnel host $TUNNEL_ID( |$)" || true; }
+
+# Points GNOME_TERMINAL_SCREEN/SERVICE at a still-open tab of the local-up window, so
+# `gnome-terminal --tab` adds tabs there (it needs both). Otherwise clears them so tabs never
+# land in the terminal this script was started from, and returns 1.
+use_local_window() {
+  local f screen service
+  unset GNOME_TERMINAL_SCREEN GNOME_TERMINAL_SERVICE
+  for f in "$SCREEN_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    read -r screen service <"$f" || true
+    if [[ -n "$screen" && -n "$service" ]] &&
+      gdbus introspect --session --dest "$service" --object-path "$screen" 2>/dev/null | grep -q 'org.gnome.Terminal.Terminal0'; then
+      export GNOME_TERMINAL_SCREEN=$screen GNOME_TERMINAL_SERVICE=$service
+      return 0
+    fi
+    rm -f "$f" # that tab is closed
+  done
+  return 1
+}
+
+# The tab command's first step: record where it runs, for use_local_window
+record_screen() { echo "echo \"\$GNOME_TERMINAL_SCREEN \$GNOME_TERMINAL_SERVICE\" > \"$SCREEN_DIR/$1\"; "; }
 
 describe_pid() {
   local pid=$1 cwd
@@ -318,9 +359,112 @@ install_deps() {
   if [[ "$printed" == true ]]; then echo; fi
 }
 
+# --- Branches (the applet's branch picker runs these) ---------------------------
+service_entry() { # service_entry <name> -> its SERVICES line
+  local svc
+  for svc in "${SERVICES[@]}"; do
+    if [[ "${svc%%|*}" == "$1" ]]; then
+      echo "$svc"
+      return 0
+    fi
+  done
+  echo "Unknown service: $1. Available: $(printf '%s ' "${SERVICES[@]%%|*}")" >&2
+  return 1
+}
+
+uncommitted_count() { git -C "$ROOT/$1" status --porcelain --untracked-files=no | wc -l; }
+
+# Tab-separated: "repo <dir> <branch> <behind> <ahead> <uncommitted>", then one line per branch,
+# newest commit first: "local|remote <name> <epoch> [*]" (* = checked out; remote = only on origin)
+list_branches() {
+  local dir=$1 branch behind ahead name date
+  local -A is_local=()
+  IFS='|' read -r branch behind ahead _ <<<"$(repo_state "$dir")"
+  printf 'repo\t%s\t%s\t%s\t%s\t%s\n' "$dir" "$branch" "$behind" "$ahead" "$(uncommitted_count "$dir")"
+  while IFS=$'\t' read -r name date; do
+    is_local[$name]=1
+    printf 'local\t%s\t%s\t%s\n' "$name" "$date" "$(if [[ "$name" == "$branch" ]]; then echo '*'; fi)"
+  done < <(git -C "$ROOT/$dir" for-each-ref --sort=-committerdate --format='%(refname:lstrip=2)%09%(committerdate:unix)' refs/heads)
+  while IFS=$'\t' read -r name date; do
+    if [[ "$name" == HEAD || -n "${is_local[$name]:-}" ]]; then continue; fi
+    printf 'remote\t%s\t%s\t\n' "$name" "$date"
+  done < <(git -C "$ROOT/$dir" for-each-ref --sort=-committerdate --format='%(refname:lstrip=3)%09%(committerdate:unix)' refs/remotes/origin)
+}
+
+# Refused while tracked files are modified, so no change is ever carried to another branch.
+# A branch that is only on origin becomes a local branch tracking it.
+switch_branch() {
+  local dir=$1 branch=$2 changes out
+  if ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+    echo "Not a valid branch name: $branch" >&2
+    return 1
+  fi
+  changes=$(uncommitted_count "$dir")
+  if ((changes > 0)); then
+    echo "$dir has $changes uncommitted change(s); commit or stash them before switching" >&2
+    return 1
+  fi
+  if ! out=$(git -C "$ROOT/$dir" switch "$branch" 2>&1); then
+    echo "$out" >&2
+    return 1
+  fi
+  echo "$dir: switched to $branch"
+}
+
 # --- Infra ------------------------------------------------------------------------
+# True when the mongod on that port is in replica set MONGO_REPLSET (without mongosh: assume it is)
+is_replset() {
+  command -v mongosh >/dev/null 2>&1 || return 0
+  [[ "$(mongosh --quiet --port "$1" --eval 'db.hello().setName || ""' 2>/dev/null)" == "$MONGO_REPLSET" ]]
+}
+
+# start_replset start|restart <port>: mongod as replica set MONGO_REPLSET, in the background.
+# restart = a mongod outside the set holds the port; the systemd one is stopped first (sudo, asked).
+start_replset() {
+  local mode=$1 port=$2 log="$LOG_DIR/mongod-$MONGO_REPLSET.log" pid
+  if [[ "$mode" == restart ]]; then
+    if ! systemctl is-active --quiet mongod; then
+      for pid in $(listener_pids "$port"); do
+        printf '  \e[33m:%s is held by %s, which is not replica set %s; stop it yourself\e[0m\n' "$port" "$(describe_pid "$pid")" "$MONGO_REPLSET"
+      done
+      return 0
+    fi
+    if [[ ! -t 0 ]] || [[ "$(ask "Stop the systemd mongod (sudo systemctl stop mongod) and start replica set $MONGO_REPLSET? [Y/n] ")" =~ ^[Nn] ]]; then
+      printf '\e[33mKeeping the systemd mongod; anything that needs replica set %s will fail.\e[0m\n' "$MONGO_REPLSET"
+      return 0
+    fi
+    sudo systemctl stop mongod
+    for _ in {1..40}; do
+      is_listening "$port" || break
+      sleep 0.25
+    done
+  fi
+
+  mkdir -p "$LOG_DIR"
+  printf '  starting mongod, replica set %s on :%s (log %s) ' "$MONGO_REPLSET" "$port" "$log"
+  # --fork returns once the server accepts connections, and keeps it running after the window closes
+  if ! mongod --replSet "$MONGO_REPLSET" --port "$port" --dbpath "$MONGO_DBPATH" --fork --logpath "$log" --logappend >/dev/null 2>&1; then
+    printf '\e[31m✗ failed, see the log\e[0m\n'
+    return 0
+  fi
+  # A dbpath that never held the set has to be initiated once
+  if ! mongosh --quiet --port "$port" --eval 'rs.status().ok' >/dev/null 2>&1; then
+    printf '(initiating) '
+    mongosh --quiet --port "$port" --eval "rs.initiate({_id: '$MONGO_REPLSET', members: [{_id: 0, host: 'localhost:$port'}]})" >/dev/null 2>&1 || true
+  fi
+  # Writes fail until this node has been elected primary, a few seconds after start
+  for _ in {1..30}; do
+    if [[ "$(mongosh --quiet --port "$port" --eval 'db.hello().isWritablePrimary' 2>/dev/null)" == true ]]; then
+      printf '\e[32m✓ primary\e[0m\n'
+      return 0
+    fi
+    sleep 0.5
+  done
+  printf '\e[33mstarted, not primary yet\e[0m\n'
+}
+
 check_infra() {
-  local svc needs=" " infra_needs entry name port unit line="" units=() down=()
+  local svc needs=" " infra_needs entry name port unit line="" units=() containers=() down=() replset=""
   for svc in "${selected[@]}"; do
     IFS='|' read -r _ _ _ _ infra_needs _ <<<"$svc"
     needs+="${infra_needs//,/ } "
@@ -328,25 +472,43 @@ check_infra() {
   for entry in "${INFRA[@]}"; do
     IFS='|' read -r name port unit <<<"$entry"
     [[ "$needs" == *" $name "* ]] || continue
-    if is_listening "$port"; then
+    if [[ "$unit" == replset ]] && is_listening "$port" && ! is_replset "$port"; then
+      line+="$name \e[31m✗ not replica set $MONGO_REPLSET\e[0m  "
+      replset="restart|$port"
+    elif is_listening "$port"; then
       line+="$name \e[32m✓\e[0m  "
     else
       line+="$name \e[31m✗\e[0m  "
       down+=("$entry")
-      units+=("$unit")
+      case "$unit" in
+        docker:*) containers+=("${unit#docker:}") ;;
+        replset) replset="start|$port" ;;
+        *) units+=("$unit") ;;
+      esac
     fi
   done
   [[ -n "$line" ]] || return 0
   printf 'Infra: %b\n' "$line"
-  [[ ${#down[@]} -gt 0 ]] || { echo; return 0; }
+  [[ ${#down[@]} -gt 0 || -n "$replset" ]] || { echo; return 0; }
 
-  if [[ "$(ask "Start ${units[*]} with sudo systemctl? [Y/n] ")" =~ ^[Nn] ]] || [[ ! -t 0 ]]; then
-    printf '\e[33mContinuing without them; services that need them will fail to connect.\e[0m\n\n'
-    return 0
+  if [[ -n "$replset" ]]; then start_replset "${replset%%|*}" "${replset#*|}"; fi
+  # Docker needs no sudo, so stopped containers are started without asking
+  if [[ ${#containers[@]} -gt 0 ]]; then
+    echo "  starting docker containers: ${containers[*]}"
+    docker start "${containers[@]}" >/dev/null || printf '  \e[31mdocker start failed\e[0m\n'
   fi
-  sudo systemctl start "${units[@]}"
+  if [[ ${#units[@]} -gt 0 ]]; then
+    if [[ "$(ask "Start ${units[*]} with sudo systemctl? [Y/n] ")" =~ ^[Nn] ]] || [[ ! -t 0 ]]; then
+      printf '\e[33mContinuing without them; services that need them will fail to connect.\e[0m\n'
+      units=()
+    else
+      sudo systemctl start "${units[@]}"
+    fi
+  fi
   for entry in "${down[@]}"; do
-    IFS='|' read -r name port _ <<<"$entry"
+    IFS='|' read -r name port unit <<<"$entry"
+    # start_replset waited for its mongod; declined systemd units are not waited for
+    if [[ "$unit" == replset ]] || [[ "$unit" != docker:* && ${#units[@]} -eq 0 ]]; then continue; fi
     printf '  waiting for %s on :%s ' "$name" "$port"
     for _ in {1..60}; do
       is_listening "$port" && break
@@ -517,10 +679,41 @@ pick_services() {
 }
 
 # --- Main ---------------------------------------------------------------------------
+# Branch commands act on the repo of the named service (nucleus, auth, ... share one repo)
+if [[ "${1:-}" =~ ^--(branches|switch|fetch|pull)$ ]]; then
+  if [[ $# -lt 2 || ("$1" == --switch && $# -lt 3) ]]; then
+    echo "Usage: ./local-up.sh $1 <service>$(if [[ "$1" == --switch ]]; then echo ' <branch>'; fi)" >&2
+    exit 2
+  fi
+  entry=$(service_entry "$2") || exit 2
+  IFS='|' read -r _ dir _ <<<"$entry"
+  case "$1" in
+    --branches) list_branches "$dir" ;;
+    --switch) switch_branch "$dir" "$3" || exit 1 ;;
+    --fetch)
+      fetch_repos "$dir" >/dev/null
+      if [[ "$(cat "$TMP_DIR/${dir//\//_}.fetch-status" 2>/dev/null)" != ok ]]; then
+        echo "$dir: fetch failed: $(grep -m1 -E 'fatal|error' "$TMP_DIR/${dir//\//_}.fetch" 2>/dev/null || echo "timed out")" >&2
+        exit 1
+      fi
+      printf '%s: fetched, %b\n' "$dir" "$(git_info "$dir")"
+      ;;
+    --pull)
+      selected=("$entry")
+      fetch_repos "$dir" >/dev/null
+      update_repos
+      install_deps
+      ;;
+  esac
+  exit 0
+fi
+
 pull=true
 all=false
 stop=false
 watch=true
+in_terminal=false
+tunnel=""
 names=()
 for arg in "$@"; do
   case "$arg" in
@@ -536,6 +729,9 @@ for arg in "$@"; do
     --all) all=true ;;
     --stop) stop=true ;;
     --no-watch) watch=false ;;
+    --in-terminal) in_terminal=true ;;
+    --tunnel) tunnel=start ;;
+    --stop-tunnel) tunnel=stop ;;
     -*)
       echo "Unknown option: $arg (see ./local-up.sh --help)" >&2
       exit 2
@@ -549,6 +745,52 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# Re-run the rest of the command line in a tab of the local-up window, where sudo, port-conflict
+# and install prompts can be answered; the tab closes 5 s after a clean run
+if [[ "$in_terminal" == true ]]; then
+  rest=()
+  for arg in "$@"; do
+    if [[ "$arg" != --in-terminal ]]; then rest+=("$(printf '%q' "$arg")"); fi
+  done
+  if use_local_window; then win=(--tab); else win=(--window --maximize); fi
+  mkdir -p "$SCREEN_DIR"
+  gnome-terminal "${win[@]}" --title=local-up --working-directory="$ROOT" -- bash -c \
+    "$(record_screen local-up)$(printf '%q' "$ROOT/$(basename "${BASH_SOURCE[0]}")") ${rest[*]} && sleep 5 || read -rp 'Something failed (see above). Press Enter to close'"
+  exit 0
+fi
+
+if [[ "$tunnel" == stop ]]; then
+  pids=$(tunnel_pids)
+  if [[ -z "$TUNNEL_ID" || -z "$pids" ]]; then
+    echo "devtunnel ${TUNNEL_ID:-(no TUNNEL_ID)}: not running"
+  else
+    # shellcheck disable=SC2086
+    kill -TERM $pids
+    echo "devtunnel $TUNNEL_ID: stopped"
+  fi
+  exit 0
+fi
+
+# The tunnel gets its own tab; it keeps running while services in other tabs restart
+if [[ "$tunnel" == start ]]; then
+  if [[ -z "$TUNNEL_ID" ]]; then
+    echo "No TUNNEL_ID: set it in $LOCAL_OVERRIDES (see \`devtunnel list\`)" >&2
+    exit 2
+  elif [[ -n "$(tunnel_pids)" ]]; then
+    echo "devtunnel $TUNNEL_ID: already running"
+  elif ! command -v devtunnel >/dev/null 2>&1; then
+    echo "Not found on PATH: devtunnel" >&2
+    exit 1
+  else
+    if use_local_window; then win=(--tab); else win=(--window --maximize); fi
+    mkdir -p "$SCREEN_DIR"
+    gnome-terminal "${win[@]}" --title=devtunnel --working-directory="$ROOT" -- bash -c \
+      "$(record_screen devtunnel)devtunnel host $TUNNEL_ID; echo; echo \"[devtunnel exited]\"; exec bash"
+    echo "devtunnel $TUNNEL_ID: started"
+  fi
+  if [[ ${#names[@]} -eq 0 && "$all" == false ]]; then exit 0; fi
+fi
 
 # Edits to the kit's tracked files are lost or conflict on the next update, and pushed they
 # change everyone's setup; say so before anything else happens
@@ -628,7 +870,8 @@ if [[ "$DISABLE_IPV6" == true && "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" !
   sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
 fi
 
-args=(--window --maximize)
+# Add the tabs to the local-up window while any of its tabs is open, else open a new window
+if use_local_window; then args=(--tab); else args=(--window --maximize); fi
 first=true
 prev_nx_name=""
 prev_nx_port=""
@@ -653,10 +896,10 @@ for svc in "${selected[@]}"; do
   args+=(
     --title="$name"
     --working-directory="$ROOT/$dir"
-    --command="bash -c '$wait_prev$cmd; echo \$? > \"$EXIT_DIR/$name.exit\"; echo; echo \"[$name exited]\"; exec bash'"
+    --command="bash -c '$(record_screen "$name")$wait_prev$cmd; echo \$? > \"$EXIT_DIR/$name.exit\"; echo; echo \"[$name exited]\"; exec bash'"
   )
 done
-mkdir -p "$EXIT_DIR"
+mkdir -p "$EXIT_DIR" "$SCREEN_DIR"
 
 # --command is deprecated but is the only way to open several tabs in one call
 gnome-terminal "${args[@]}" 2>/dev/null

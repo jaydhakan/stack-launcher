@@ -240,6 +240,22 @@ def local_stack(localup_path, procs, cpu_pct, cwds, ports):
     return out, [{**i, "up": i["port"] in ports} for i in infra]
 
 
+def tunnel_state(localup_path, procs):
+    """TUNNEL_ID (local-up.local.sh wins) and whether `devtunnel host <id>` runs; it listens on no local port."""
+    root = os.path.dirname(localup_path)
+    texts = [read_file(localup_path) or "", read_file(os.path.join(root, "local-up.local.sh")) or ""]
+    match = find_block(texts, r"^TUNNEL_ID=[\"']?([^\"'\s#]*)")
+    if not match or not match.group(1):
+        return None
+    tunnel_id = match.group(1)
+    pattern = re.compile(rf"^(\S*/)?devtunnel host {re.escape(tunnel_id)}( |$)")
+    up = any(
+        pattern.match((read_file(f"/proc/{pid}/cmdline", "rb") or b"").replace(b"\0", b" ").decode(errors="replace"))
+        for pid, p in procs.items() if p["comm"] == "devtunnel"
+    )
+    return {"id": tunnel_id, "up": up}
+
+
 def main():
     full = "--full" in sys.argv
     localup = sys.argv[sys.argv.index("--localup") + 1] if "--localup" in sys.argv else ""
@@ -288,6 +304,7 @@ def main():
     snapshot["topCpu"] = top(groups, "cpu", 1)
     if localup:
         snapshot["services"], snapshot["infra"] = local_stack(localup, procs, cpu_pct, cwds, listening_ports())
+        snapshot["tunnel"] = tunnel_state(localup, procs)
     print(json.dumps(snapshot))
 
 

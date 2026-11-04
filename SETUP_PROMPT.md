@@ -23,7 +23,7 @@ Your job is to install both, adapt them to **this** machine, test everything, an
 Check and report:
 - **Desktop:** `echo $XDG_CURRENT_DESKTOP; cinnamon --version`. The applet needs Cinnamon 4 or later. If this isn't Cinnamon, skip Steps 4 and 6 (the applet) and say so; `local-up.sh` still works.
 - **Tools:** `bash` 4.4 or later, `git`, `python3` 3.9 or later (standard library only, no pip packages), `ss`, `lsof`, `timeout`, `gnome-terminal`, `gnome-screenshot` (used for testing), `node`/`npm`/`npx`, `uv`.
-- **Infra:** `local-up.sh` expects systemd units `mongod`, `redis-server`, `postgresql`, `kafka`, on ports 27017, 6379, 5432 and 9092. Check with `systemctl list-units --type=service | grep -iE "mongo|redis|postgres|kafka"` and `ss -ltn`. If a unit has a different name here, or the service runs in Docker, redefine `INFRA=(...)` in `local-up.local.sh` (Step 3), or tell the user the auto-start offer won't apply.
+- **Infra:** `local-up.sh` expects systemd units `mongod`, `redis-server`, `postgresql`, `kafka`, on ports 27017, 6379, 5432 and 9092. Check with `systemctl list-units --type=service | grep -iE "mongo|redis|postgres|kafka"` and `ss -ltn`. If a unit has a different name here, set `INFRA_UNIT[<name>]` in `local-up.local.sh` (Step 3). A service running in Docker gets `INFRA_UNIT[<name>]=docker:<container>` (check with `docker ps -a`). If form-builder's Mongo URL has `replicaSet=` (grep only that), or the user runs `mongod --replSet ...` by hand, ask the user whether to set `INFRA_UNIT[mongo]=replset` (plus `MONGO_REPLSET` / `MONGO_DBPATH` when they differ from `rs0` / `/data/db`).
 
 ## Step 2: Clone the kit and install it
 
@@ -44,7 +44,7 @@ Most machines need nothing here: backend ports are read from each repo's own `.e
 1. Run `./local-up.sh --help`. The table shows each service's port, its repo folder and where the port came from (`<KEY> in .env`, `app default` or `fixed`). Report the table.
 2. **Repo folders:** check every repo folder in the table exists under the root. If a repo has another folder name here, set `SERVICE_DIR[<service>]=<folder>`. If a repo isn't cloned, tell the user; the script skips missing repos.
 3. **Ports:** only if a port in the table is wrong for this machine, set `SERVICE_PORT[<service>]=<port>`. Never edit a `.env`. When checking `.env` files, grep only these keys: `NUCLEUS_PORT`, `AUTH_PORT`, `NOTIFICATION_PORT`, `PAYMENT_MANAGER_PORT`, `AGRISPHERE_PORT`, `AUDITOR_PORT` (node monorepo `.env`), `RESPONSE_HUB_APP_PORT`, `CATALYST_APP_PORT` (python `.env`) and `APP_PORT` (form-builder `.env`). The Vite UIs (client 5173 … backoffice 5177) are fixed by the script.
-4. **Infra:** if a unit name or port differs (Step 1), set `INFRA_UNIT[<name>]=...` or `INFRA_PORT[<name>]=...`. Leave `DISABLE_IPV6` at its default (`true`): the Node services need IPv6 disabled. Never turn it off to avoid the sudo prompt; only the user may decide that.
+4. **Infra:** if a unit name or port differs (Step 1), set `INFRA_UNIT[<name>]=...` (a systemd unit, `docker:<container>` or `replset`) or `INFRA_PORT[<name>]=...`. **Dev tunnel:** if the `.env` files use `*.devtunnels.ms` URLs and the user hosts that tunnel with the `devtunnel` CLI, set `TUNNEL_ID` (from `devtunnel list`); otherwise leave it unset. Leave `DISABLE_IPV6` at its default (`true`): the Node services need IPv6 disabled. Never turn it off to avoid the sudo prompt; only the user may decide that.
 5. Put these lines in `<root>/local-up.local.sh`, starting from the kit's `local-up.local.example.sh`. Re-run `--help` to confirm. Never change the kit's tracked files: `git -C <root>/stack-launcher status` must stay clean.
 6. **Leave these as they are:**
    - `DEFAULT_OFF`: payment-manager, agrisphere-api, auditor, catalyst and agrisphere-ui start unticked.
@@ -72,7 +72,9 @@ Most machines need nothing here: backend ports are read from each repo's own `.e
    - the run exits cleanly.
 3. **Dependencies:** the script installs dependencies when `node_modules` is missing, when its pull changed a lockfile, or when `package-lock.json` is newer than `node_modules/.package-lock.json` (stale since an earlier pull or branch switch). Run `./local-up.sh --no-pull --no-watch <one stopped service>` and check the "Installing dependencies" lines. Logs are in `~/.cache/aicl-local-up/install-<repo>.log`. Make sure `git status` in that repo stays clean afterwards.
 4. **Stop path:** `./local-up.sh --stop catalyst` (or any service that isn't running) prints `not running`.
-5. **Real run:** ask the user first. The checklist needs a real terminal, so ask the user to run `./local-up.sh` themselves and paste the output, or run `./local-up.sh --no-watch client` yourself. Then confirm with `ss -ltn` that the ports are listening, and that the pull log shows each repo's branch.
+5. **Branch commands, read-only:** `./local-up.sh --branches client` prints a `repo` line, then `local` / `remote` lines newest first. `--switch <a service whose repo has uncommitted changes> main` is refused with exit 1 and names the count. Don't switch a real repo; to test a switch, clone one repo into a temp folder with a copy of `local-up.sh` beside it.
+6. **One window:** with stub `npm` that just `sleep`s, start two stopped UI services in two separate runs; the second run must add a tab, not a window (count `gdbus introspect --session --dest org.gnome.Terminal --object-path /org/gnome/Terminal/window` nodes). Delete the stub runs' exit markers afterwards.
+7. **Real run:** ask the user first. The checklist needs a real terminal, so ask the user to run `./local-up.sh` themselves and paste the output, or run `./local-up.sh --no-watch client` yourself. Then confirm with `ss -ltn` that the ports are listening, and that the pull log shows each repo's branch.
 
 ## Step 6: Test the applet (report each result)
 
@@ -91,6 +93,8 @@ ev "$A.menu.open(true); 'ok'"; sleep 4; gnome-screenshot -f /tmp/applet.png; ev 
 5. **Crash detection:** when a service's tab command ends, the tab writes its exit code to `~/.cache/aicl-local-up/exit/<name>.exit`, and the applet shows a red `✗ exited (code)` instead of a stuck `starting…`. To test it, mark a service pending with `ev "$A._markPending(['catalyst'],'starting')"`, write a fake marker with `bash -c 'false; echo $? > ~/.cache/aicl-local-up/exit/catalyst.exit'`, check that the row shows `exited (1)` within one refresh, then delete the marker.
 6. **Update item:** near the bottom, the menu shows `✓ stack-launcher is up to date (<sha>)`. Within a few seconds of loading it fetches the kit's origin; if fetching fails, it says `could not reach GitHub`. Clicking it runs `update.sh` in a terminal (fetch over HTTPS, fast-forward, `install.sh --reload`). Check it from the shell: `<root>/stack-launcher/update.sh --check` prints `0 <sha> 0` (nothing behind, nothing edited).
 7. If `stats.py` fails, the panel shows `monitor ✗` and the reason is in the tooltip and in `~/.xsession-errors`.
+8. **Branch picker:** `ev "$A._openBranchPicker('client'); 'ok'"` opens a dialog listing the repo's branches; `$A._picker._search.set_text('main')` filters them, and on a repo with uncommitted changes `$A._picker._switch('main')` leaves a "commit or stash them" message in `$A._picker._status`. Close it with `$A._picker._dialog.close()`.
+9. **Tunnel row:** only with `TUNNEL_ID` set. The row under Infra shows `● running` or `○ stopped`, matching `pgrep -af '^devtunnel host'`. Ask before clicking it: it starts or stops the tunnel.
 
 ## Step 7: Report
 

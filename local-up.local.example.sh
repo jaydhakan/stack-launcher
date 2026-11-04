@@ -20,6 +20,19 @@
 # INFRA_PORT[kafka]=29092
 # INFRA_UNIT[kafka]=confluent-kafka
 
+# Infra run in Docker: started with `docker start <container>`, no sudo prompt
+# INFRA_UNIT[kafka]=docker:kafka
+
+# Mongo as a replica set (form-builder needs one): runs
+# `mongod --replSet $MONGO_REPLSET --dbpath $MONGO_DBPATH --fork` instead of the systemd mongod,
+# initiates the set on first use, and offers to stop the systemd mongod when it holds the port
+# INFRA_UNIT[mongo]=replset
+# MONGO_REPLSET=rs0
+# MONGO_DBPATH=/data/db
+
+# Dev tunnel for `./local-up.sh --tunnel` and the applet's tunnel row (`devtunnel list` shows the ID)
+# TUNNEL_ID=my-tunnel-id.inc1
+
 # Services unticked in the checklist until you pick them once (replaces the whole list)
 # DEFAULT_OFF=(payment-manager agrisphere-api auditor catalyst agrisphere-ui)
 

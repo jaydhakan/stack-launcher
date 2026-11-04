@@ -13,7 +13,9 @@ Start, stop and monitor your local service stack: a pick-and-run script plus a L
 - **AICL Local Monitor** (`aicl-local-monitor@aicl/`) is a panel applet:
   - **Panel:** live CPU, RAM, swap and temperature.
   - **Click it:** system stats, the top apps by memory and CPU, and every local service with its branch, memory and CPU.
-  - **Service controls:** tick services and press **Start selected**, or use ▶ start, ↻ restart, ■ stop and ↗ open on each row.
+  - **Service controls:** tick services and press **Start selected**, or use ▶ start, ↻ restart, ■ stop and ↗ open on each row. Starts open as tabs in one terminal window.
+  - **Branches:** click a row's `branch ▾` to search the repo's branches and switch, fetch or pull (switching is blocked while the repo has uncommitted changes).
+  - **Dev tunnel:** with `TUNNEL_ID` set, a row shows whether the tunnel runs; click it to start or stop.
   - **Updates:** it tells you when the kit has new commits; clicking that updates it.
 
 ## Install
@@ -40,6 +42,8 @@ It adapts the setup to your machine and tests everything.
 ./local-up.sh            # checklist → pull → start (your last pick is remembered)
 ./local-up.sh --help     # all options and every service with its port and default
 ./local-up.sh --stop     # stop everything (or: --stop client auth)
+./local-up.sh --tunnel   # host the dev tunnel (TUNNEL_ID in local-up.local.sh) in a tab
+./local-up.sh --switch client feature/x   # switch a repo's branch (also --branches, --fetch, --pull)
 ```
 
 ## Update
@@ -55,6 +59,9 @@ Click **Update stack-launcher** in the applet, or run `./stack-launcher/update.s
   SERVICE_PORT[client]=5180                       # another port
   SERVICE_DIR[form-builder-api]=my-folder-name    # another clone folder
   INFRA_UNIT[kafka]=confluent-kafka               # another systemd unit
+  INFRA_UNIT[kafka]=docker:kafka                  # or a Docker container
+  INFRA_UNIT[mongo]=replset                       # Mongo as replica set rs0 (form-builder)
+  TUNNEL_ID=my-tunnel-id.inc1                     # dev tunnel for --tunnel
   ```
 
   That file is git-ignored, and both the script and the applet read it.

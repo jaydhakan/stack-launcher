@@ -3,6 +3,8 @@ const PopupMenu = imports.ui.popupMenu;
 const Settings = imports.ui.settings;
 const Util = imports.misc.util;
 const Mainloop = imports.mainloop;
+const ModalDialog = imports.ui.modalDialog;
+const Clutter = imports.gi.Clutter;
 const GLib = imports.gi.GLib;
 const St = imports.gi.St;
 
@@ -12,6 +14,10 @@ const TOP_ROWS = 10;
 const MONO = "font-family: monospace;";
 const COMPACT = "padding-top: 1px; padding-bottom: 1px;";
 const BUTTON = "font-family: monospace; padding: 0 7px; margin-left: 3px; border-radius: 4px; background-color: rgba(255,255,255,0.10);";
+const BRANCH_BUTTON = "font-family: monospace; padding: 0; border-radius: 3px;";
+const PICKER_ROW = "padding: 3px 6px; border-radius: 4px;";
+const PICKER_ROW_HOVER = `${PICKER_ROW} background-color: rgba(255,255,255,0.12);`;
+const MAX_PICKER_ROWS = 200;
 const MEM_COL_WIDTH = 46;
 const BRANCH_WIDTH = 30;
 const RED = "#ff6b6b";
@@ -64,6 +70,17 @@ function fit(text, width) {
     return text.length > width ? `${text.slice(0, width - 1)}…` : text.padEnd(width);
 }
 
+function ago(epoch) {
+    const days = Math.floor((Date.now() / 1000 - epoch) / 86400);
+    if (days < 1) return "today";
+    return days < 14 ? `${days}d ago` : `${Math.floor(days / 7)}w ago`;
+}
+
+// local-up.sh colours its terminal output; the branch picker shows it as plain text
+function plain(text) {
+    return text.replace(/\x1b\[[0-9;]*m/g, "").replace(/[ \t]+/g, " ").trim();
+}
+
 // One local service: click the row to (un)select it, buttons act on it right away
 class ServiceItem extends PopupMenu.PopupBaseMenuItem {
     _init(applet, name) {
@@ -74,11 +91,18 @@ class ServiceItem extends PopupMenu.PopupBaseMenuItem {
 
         this._check = new St.Label({ style: MONO });
         this._info = new St.Label({ style: MONO });
+        // The branch is a dropdown: it opens the branch picker for this service's repo
+        this._branchLabel = new St.Label({ style: MONO });
+        this._branch = new St.Button({ child: this._branchLabel, style: BRANCH_BUTTON, reactive: true, track_hover: true });
+        this._branch.connect("clicked", () => applet._openBranchPicker(name));
+        this._usage = new St.Label({ style: MONO });
         this._buttons = new St.BoxLayout();
         // One spanning box: separate actors would be aligned to the menu's shared column widths
         const row = new St.BoxLayout();
         row.add(this._check);
-        row.add(this._info, { expand: true });
+        row.add(this._info);
+        row.add(this._branch);
+        row.add(this._usage, { expand: true });
         row.add(this._buttons);
         this.addActor(row, { span: -1, expand: true });
 
@@ -99,7 +123,7 @@ class ServiceItem extends PopupMenu.PopupBaseMenuItem {
     update(svc, selected, pending) {
         this._check.clutter_text.set_markup(` ${paint(selected ? "☑" : "☐", selected ? GREEN : GREY)}`);
 
-        const branch = fit(svc.branch || "-", BRANCH_WIDTH);
+        const branch = `${fit(svc.branch || "-", BRANCH_WIDTH - 2)} ▾`;
         const mainBranch = ["main", "master", "development"].includes(svc.branch);
         let dot = paint("○", GREY);
         let usage = "".padEnd(13);
@@ -114,14 +138,170 @@ class ServiceItem extends PopupMenu.PopupBaseMenuItem {
             usage = paint(fit(`exited (${svc.exitCode})`, 13), RED);
         }
         const nameText = svc.up || pending || svc.exitCode !== null ? esc(fit(svc.name, 17)) : paint(fit(svc.name, 17), GREY);
-        this._info.clutter_text.set_markup(
-            ` ${dot} ${nameText} ${paint(fit(`:${svc.port}`, 6), GREY)} ${paint(branch, mainBranch ? GREY : YELLOW)} ${usage}`
-        );
+        // Each label's markup starts with a plain space (see CLAUDE.md: markup at index 0 is dropped)
+        this._info.clutter_text.set_markup(` ${dot} ${nameText} ${paint(fit(`:${svc.port}`, 6), GREY)}`);
+        this._branchLabel.clutter_text.set_markup(` ${paint(branch, mainBranch ? GREY : YELLOW)}`);
+        this._usage.clutter_text.set_markup(` ${usage}`);
 
         this._btn.start.visible = !svc.up && !pending;
         this._btn.restart.visible = svc.up && !pending;
         this._btn.stop.visible = svc.up && !pending;
         this._btn.open.visible = svc.up;
+    }
+}
+
+// Branch picker for the repo of one service: type to filter, click a branch (or Enter for the first
+// match) to switch. Fetch / Pull act on the whole repo, which the node services share.
+class BranchPicker {
+    constructor(applet, service) {
+        this._applet = applet;
+        this._service = service;
+        this._repo = null;
+        this._branches = [];
+        this._running = [];
+        this._busy = false;
+
+        this._dialog = new ModalDialog.ModalDialog({ destroyOnClose: true });
+        const box = new St.BoxLayout({ vertical: true, style: "spacing: 8px; min-width: 620px;" });
+        this._title = new St.Label({ text: service, style: "font-weight: bold; font-size: 1.15em;" });
+        this._state = new St.Label({ text: "loading…", style: MONO });
+        this._search = new St.Entry({ hint_text: "Search branches…", can_focus: true, style: MONO });
+        this._search.clutter_text.connect("text-changed", () => this._render());
+        this._search.clutter_text.connect("activate", () => {
+            const first = this._filtered().find((b) => !b.current);
+            if (first) this._switch(first.name);
+        });
+        this._list = new St.BoxLayout({ vertical: true });
+        const scroll = new St.ScrollView({
+            style: "max-height: 420px;",
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+        });
+        scroll.add_actor(this._list);
+        this._status = new St.Label({ style: MONO });
+        this._status.clutter_text.line_wrap = true;
+        for (const actor of [this._title, this._state, this._search, scroll, this._status]) box.add_child(actor);
+        this._dialog.contentLayout.add_child(box);
+        this._dialog.setInitialKeyFocus(this._search.clutter_text);
+        this._setButtons();
+        this._dialog.open();
+        this._load();
+    }
+
+    _setButtons() {
+        const buttons = [
+            { label: "Fetch", action: () => this._fetch() },
+            { label: "Pull", action: () => this._pull() },
+        ];
+        if (this._running.length) {
+            buttons.push({ label: `Restart ${this._running.length} running`, action: () => this._restart(), default: true });
+        }
+        buttons.push({ label: "Close", action: () => this._dialog.close(), key: Clutter.KEY_Escape });
+        this._dialog.setButtons(buttons);
+    }
+
+    _setStatus(text, color) {
+        this._status.clutter_text.set_markup(paint(text, color));
+    }
+
+    _run(args, done) {
+        this._busy = true;
+        Util.spawnCommandLineAsyncIO("", (stdout, stderr, exitCode) => {
+            this._busy = false;
+            done(stdout, plain(stderr), exitCode);
+        }, { argv: [this._applet._localupPath(), ...args] });
+    }
+
+    _load() {
+        this._run(["--branches", this._service], (stdout, stderr, exitCode) => {
+            if (exitCode !== 0) {
+                this._setStatus(stderr || "could not list branches", RED);
+                return;
+            }
+            const lines = stdout.trim().split("\n").map((line) => line.split("\t"));
+            const [, dir, branch, behind, ahead, uncommitted] = lines[0];
+            this._repo = { dir, branch, behind: Number(behind), ahead: Number(ahead), uncommitted: Number(uncommitted) };
+            this._branches = lines.slice(1).map(([kind, name, date, mark]) => ({ kind, name, date: Number(date), current: mark === "*" }));
+            this._title.set_text(dir);
+            const parts = [`on ${paint(branch, YELLOW)}`];
+            if (this._repo.behind) parts.push(paint(`↓${behind} behind origin`, ORANGE));
+            if (this._repo.ahead) parts.push(paint(`↑${ahead} ahead`, GREY));
+            if (this._repo.uncommitted) parts.push(paint(`${uncommitted} uncommitted, switching disabled`, RED));
+            this._state.clutter_text.set_markup(parts.join("  ·  "));
+            this._render();
+        });
+    }
+
+    _filtered() {
+        const words = this._search.get_text().toLowerCase().split(/\s+/).filter(Boolean);
+        return this._branches.filter((b) => words.every((w) => b.name.toLowerCase().includes(w)));
+    }
+
+    _render() {
+        this._list.destroy_all_children();
+        const matches = this._filtered();
+        for (const b of matches.slice(0, MAX_PICKER_ROWS)) {
+            const label = new St.Label({ style: MONO, x_align: Clutter.ActorAlign.START, x_expand: true });
+            label.clutter_text.set_markup(
+                `${b.current ? paint("●", GREEN) : " "} ${esc(fit(b.name, 56))} ${paint(fit(b.kind === "remote" ? "origin" : "local", 7), GREY)} ${paint(ago(b.date), GREY)}`
+            );
+            const row = new St.Button({ child: label, style: PICKER_ROW, reactive: !b.current, track_hover: true, x_expand: true });
+            row.connect("notify::hover", () => row.set_style(row.hover ? PICKER_ROW_HOVER : PICKER_ROW));
+            row.connect("clicked", () => this._switch(b.name));
+            this._list.add_child(row);
+        }
+        const hidden = matches.length - MAX_PICKER_ROWS;
+        if (!matches.length) this._list.add_child(new St.Label({ text: "  No branch matches", style: MONO }));
+        else if (hidden > 0) this._list.add_child(new St.Label({ text: `  … ${hidden} more, refine the search`, style: MONO }));
+    }
+
+    _switch(name) {
+        if (this._busy || !this._repo) return;
+        if (this._repo.uncommitted) {
+            this._setStatus(`${this._repo.dir} has ${this._repo.uncommitted} uncommitted change(s); commit or stash them before switching`, RED);
+            return;
+        }
+        this._setStatus(`switching to ${name}…`, YELLOW);
+        this._run(["--switch", this._service, name], (stdout, stderr, exitCode) => {
+            if (exitCode !== 0) this._setStatus(stderr || "switch failed", RED);
+            else this._changed(plain(stdout));
+        });
+    }
+
+    _fetch() {
+        if (this._busy) return;
+        this._setStatus("fetching…", YELLOW);
+        this._run(["--fetch", this._service], (stdout, stderr, exitCode) => {
+            this._setStatus(exitCode === 0 ? plain(stdout) : stderr, exitCode === 0 ? GREEN : RED);
+            this._load();
+        });
+    }
+
+    _pull() {
+        if (this._busy) return;
+        this._setStatus("pulling… (installs dependencies when the lockfile changed)", YELLOW);
+        this._run(["--pull", this._service], (stdout, stderr, exitCode) => {
+            const out = plain(stdout.replace(/^Updating from origin:\s*/, "")).replace(/\n+/g, "\n");
+            if (exitCode !== 0 || /FAILED|failed/.test(out)) this._setStatus(out || stderr, RED);
+            else if (/updated/.test(out)) this._changed(out);
+            else this._setStatus(out, GREEN);
+            this._load();
+        });
+    }
+
+    // After a switch, or a pull that moved HEAD: offer to restart what runs from this repo
+    _changed(message) {
+        const dir = this._repo.dir;
+        this._running = this._applet._services.filter((s) => s.dir === dir && s.up).map((s) => s.name);
+        this._setStatus(this._running.length ? `${message}\nRunning from this repo: ${this._running.join(", ")}` : message, GREEN);
+        this._setButtons();
+        this._applet._refresh();
+        this._load();
+    }
+
+    _restart() {
+        this._applet._restartServices(this._running);
+        this._dialog.close();
     }
 }
 
@@ -312,6 +492,14 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
         this._localSection = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._localSection);
         this._infraRow = this._textRow(this.menu);
+        // Clickable: starts or stops the dev tunnel; hidden while no TUNNEL_ID is set
+        this._tunnel = null;
+        this._tunnelItem = new PopupMenu.PopupMenuItem("");
+        this._tunnelItem.label.set_style(MONO);
+        this._tunnelItem.actor.set_style(COMPACT);
+        this._tunnelItem.connect("activate", () => this._toggleTunnel());
+        this._tunnelItem.actor.hide();
+        this.menu.addMenuItem(this._tunnelItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._startItem = new PopupMenu.PopupMenuItem("▶  Start selected");
@@ -366,6 +554,21 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
 
         this._services = d.services || [];
         this._updateLocalStack(d.infra || []);
+        this._tunnel = d.tunnel || null;
+        this._updateTunnel();
+    }
+
+    _updateTunnel() {
+        const t = this._tunnel;
+        this._tunnelItem.actor.visible = t !== null;
+        if (!t) return;
+        this._setRow(this._tunnelItem,
+            ` Tunnel ${paint(t.up ? "●" : "○", t.up ? GREEN : GREY)} ${esc(t.id)}  ${paint(t.up ? "running · click to stop" : "stopped · click to start", GREY)}`);
+    }
+
+    _toggleTunnel() {
+        if (!this._tunnel) return;
+        Util.spawn([this._localupPath(), this._tunnel.up ? "--stop-tunnel" : "--tunnel"]);
     }
 
     // --- Local stack -----------------------------------------------------------
@@ -449,12 +652,16 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
         this._updateLocalStack(null);
     }
 
-    // Starts go through local-up.sh in a terminal: it may need sudo, a port-conflict answer or an install
     _runInTerminal(script) {
         Util.spawn([
             "gnome-terminal", "--title=local-up", "--", "bash", "-c",
             `${script} && sleep 5 || read -rp "Something failed (see above). Press Enter to close"`,
         ]);
+    }
+
+    // Starts go through local-up.sh in a tab of its window: it may need sudo, a port-conflict answer or an install
+    _runLocalup(args) {
+        Util.spawn([this._localupPath(), "--in-terminal", ...args]);
     }
 
     _startSelected() {
@@ -463,7 +670,7 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
             .map((s) => s.name);
         if (!names.length) return;
         this._markPending(names, "starting");
-        this._runInTerminal(`"${this._localupPath()}" --no-watch ${names.join(" ")}`);
+        this._runLocalup(["--no-watch", ...names]);
     }
 
     _stopAll() {
@@ -474,7 +681,6 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
 
     _serviceAction(action, name) {
         const svc = this._services.find((s) => s.name === name);
-        const localup = `"${this._localupPath()}"`;
         if (action === "open") {
             Util.spawn(["xdg-open", `http://localhost:${svc.port}${svc.path}`]);
             this.menu.close();
@@ -483,11 +689,23 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
             Util.spawn([this._localupPath(), "--stop", name]);
         } else if (action === "start") {
             this._markPending([name], "starting");
-            this._runInTerminal(`${localup} --no-pull --no-watch ${name}`);
+            this._runLocalup(["--no-pull", "--no-watch", name]);
         } else if (action === "restart") {
-            this._markPending([name], "restarting");
-            this._runInTerminal(`${localup} --stop ${name} && ${localup} --no-pull --no-watch ${name}`);
+            this._restartServices([name]);
         }
+    }
+
+    // One stop, then one start: local-up.sh starts nx services one at a time only within a single run
+    _restartServices(names) {
+        if (!names.length) return;
+        const localup = `"${this._localupPath()}"`;
+        this._markPending(names, "restarting");
+        Util.spawn(["bash", "-c", `${localup} --stop ${names.join(" ")} && ${localup} --in-terminal --no-pull --no-watch ${names.join(" ")}`]);
+    }
+
+    _openBranchPicker(name) {
+        this.menu.close();
+        this._picker = new BranchPicker(this, name);
     }
 }
 
