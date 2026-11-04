@@ -184,8 +184,6 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
     // --- Self-update -----------------------------------------------------------
 
     _checkForUpdate() {
-        const script = 'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" timeout 30 git fetch -q origin && ' +
-            'echo "$(git rev-list --count HEAD..@{u}) $(git rev-parse --short HEAD) $(git status --porcelain --untracked-files=no | wc -l)"';
         Util.spawnCommandLineAsyncIO("", (stdout, stderr, exitCode) => {
             const [behind, head, edited] = (stdout || "").trim().split(" ");
             if (exitCode !== 0 || !head) {
@@ -202,13 +200,13 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
             } else {
                 this._updateItem.label.set_text(`✓  stack-launcher is up to date (${head})`);
             }
-        }, { argv: ["bash", "-c", `cd "${this._kitDir}" && ${script}`] });
+        }, { argv: [`${this._kitDir}/update.sh`, "--check"] });
     }
 
-    // install.sh --reload replaces this applet instance, so nothing runs after it here
+    // update.sh ends with install.sh --reload, which replaces this applet instance
     _update() {
         this.menu.close();
-        this._runInTerminal(`cd "${this._kitDir}" && git pull --ff-only && ./install.sh --reload`);
+        this._runInTerminal(`"${this._kitDir}/update.sh"`);
     }
 
     _schedule() {

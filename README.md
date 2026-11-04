@@ -44,7 +44,7 @@ It adapts the setup to your machine and tests everything.
 
 ## Update
 
-Click **Update stack-launcher** in the applet, or run `cd stack-launcher && git pull && ./install.sh --reload`.
+Click **Update stack-launcher** in the applet, or run `./stack-launcher/update.sh`. Both fetch over HTTPS, so no SSH key is needed.
 
 ## Ports, folders and other machine-specific settings
 
