@@ -14,6 +14,9 @@
 #   ./local-up.sh --branches <service>         # list the branches of that service's repo
 #   ./local-up.sh --switch <service> <branch>  # switch that repo (refused while it has uncommitted changes)
 #   ./local-up.sh --fetch|--pull <service>     # fetch, or fetch + fast-forward (+ install if the lockfile changed)
+#   ./local-up.sh --reset <service>            # reset --hard the checked-out branch to origin (--reset-preview: what is lost)
+#   ./local-up.sh --client-sync <service> <source> <target> [--force] [--dry-run]
+#                                              # push origin/<source> to the client remote's <target>
 #   ./local-up.sh --list           # show available service names
 #   ./local-up.sh --help           # show this help and every service with its port
 #
@@ -93,6 +96,10 @@ MONGO_REPLSET="rs0"
 MONGO_DBPATH="/data/db"
 # Dev tunnel ID for --tunnel (`devtunnel list`); empty = no tunnel
 TUNNEL_ID=""
+# --client-sync deploys origin branches to this remote of a repo (only repos that have it);
+# main is deployed as CLIENT_MAIN_BRANCH there
+CLIENT_REMOTE="client"
+CLIENT_MAIN_BRANCH="client-main"
 LOCAL_OVERRIDES="$ROOT/local-up.local.sh"
 if [[ -f "$LOCAL_OVERRIDES" ]]; then
   # shellcheck disable=SC1090
@@ -381,6 +388,10 @@ list_branches() {
   local -A is_local=()
   IFS='|' read -r branch behind ahead _ <<<"$(repo_state "$dir")"
   printf 'repo\t%s\t%s\t%s\t%s\t%s\n' "$dir" "$branch" "$behind" "$ahead" "$(uncommitted_count "$dir")"
+  # Only repos with the client remote get the "Push to client" actions
+  if git -C "$ROOT/$dir" remote get-url "$CLIENT_REMOTE" >/dev/null 2>&1; then
+    printf 'client\t%s\t%s\n' "$CLIENT_REMOTE" "$CLIENT_MAIN_BRANCH"
+  fi
   while IFS=$'\t' read -r name date; do
     is_local[$name]=1
     printf 'local\t%s\t%s\t%s\n' "$name" "$date" "$(if [[ "$name" == "$branch" ]]; then echo '*'; fi)"
@@ -409,6 +420,121 @@ switch_branch() {
     return 1
   fi
   echo "$dir: switched to $branch"
+}
+
+# Reads/pushes from the applet run without a terminal: fail instead of waiting on an SSH prompt
+git_batch() {
+  if [[ -t 0 ]]; then GIT_TERMINAL_PROMPT=0 git "$@"; else GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" git "$@"; fi
+}
+
+# fetch_branch <dir> <branch>: refreshes origin/<branch> only (follows force-pushes)
+fetch_branch() {
+  git_batch -C "$ROOT/$1" fetch -q origin "+refs/heads/$2:refs/remotes/origin/$2" 2>/dev/null || {
+    echo "$1: origin/$2 does not exist or could not be fetched" >&2
+    return 1
+  }
+}
+
+# Tab-separated: "reset <branch> <local-only commits> <origin-only commits> <uncommitted>", then
+# "lost <sha subject>" per local-only commit and "file <status path>" per uncommitted change
+reset_preview() {
+  local dir=$1 branch
+  branch=$(git -C "$ROOT/$dir" branch --show-current)
+  [[ -n "$branch" ]] || { echo "$dir: HEAD is detached; check out a branch first" >&2; return 1; }
+  fetch_branch "$dir" "$branch" || return 1
+  printf 'reset\t%s\t%s\t%s\t%s\n' "$branch" \
+    "$(git -C "$ROOT/$dir" rev-list --count "origin/$branch..HEAD")" \
+    "$(git -C "$ROOT/$dir" rev-list --count "HEAD..origin/$branch")" "$(uncommitted_count "$dir")"
+  git -C "$ROOT/$dir" log --format='lost%x09%h %s' -n 20 "origin/$branch..HEAD"
+  git -C "$ROOT/$dir" status --porcelain --untracked-files=no | head -n 20 | sed 's/^/file\t/'
+}
+
+# Makes the checked-out branch exactly origin's: local-only commits (still in `git reflog`) and
+# uncommitted changes to tracked files are discarded; untracked files are kept
+reset_to_origin() {
+  local entry=$1 dir before
+  IFS='|' read -r _ dir _ <<<"$entry"
+  local branch
+  branch=$(git -C "$ROOT/$dir" branch --show-current)
+  [[ -n "$branch" ]] || { echo "$dir: HEAD is detached; check out a branch first" >&2; return 1; }
+  fetch_branch "$dir" "$branch" || return 1
+  before=$(git -C "$ROOT/$dir" rev-parse HEAD)
+  git -C "$ROOT/$dir" reset -q --hard "origin/$branch"
+  echo "$dir: reset $branch to origin/$branch ($(git -C "$ROOT/$dir" log -1 --format='%h %s'))"
+  if ! git -C "$ROOT/$dir" diff --quiet "$before" HEAD -- package-lock.json uv.lock; then lock_changed[$dir]=1; fi
+  selected=("$entry")
+  install_deps
+}
+
+# Deploys origin's commit of <source> to <CLIENT_REMOTE>/<target> (never the local branch, so
+# unpushed or uncommitted work is never deployed). A push that would drop commits from the
+# client branch is refused (exit 3) unless forced, and the lease pinned to the inspected commit
+# rejects the push if the client branch moves in the meantime.
+# --dry-run prints "plan <create|same|fast-forward|rewrite> <commits added> <commits dropped>",
+# then "new <sha subject>" / "drop <sha subject>" lines, and "local <n>" for unpushed local commits.
+client_sync() {
+  local dir=$1 source=$2 target=$3 force=$4 dry=$5 repo src client kind b added=0 dropped=0 local_only=0
+  repo="$ROOT/$dir"
+  if ! git -C "$repo" remote get-url "$CLIENT_REMOTE" >/dev/null 2>&1; then
+    echo "$dir has no '$CLIENT_REMOTE' remote" >&2
+    return 1
+  fi
+  for b in "$source" "$target"; do
+    git check-ref-format --branch "$b" >/dev/null 2>&1 || { echo "Not a valid branch name: $b" >&2; return 1; }
+  done
+  fetch_branch "$dir" "$source" || return 1
+  src=$(git -C "$repo" rev-parse --verify "refs/remotes/origin/$source^{commit}")
+  if ! client=$(git_batch -C "$repo" ls-remote "$CLIENT_REMOTE" "refs/heads/$target" | cut -f1); then
+    echo "could not reach the '$CLIENT_REMOTE' remote" >&2
+    return 1
+  fi
+
+  if [[ -z "$client" ]]; then
+    kind=create
+  elif [[ "$client" == "$src" ]]; then
+    kind=same
+  else
+    git_batch -C "$repo" fetch -q --no-tags "$CLIENT_REMOTE" "+refs/heads/$target:refs/remotes/$CLIENT_REMOTE/$target" || {
+      echo "could not fetch $CLIENT_REMOTE/$target" >&2
+      return 1
+    }
+    if git -C "$repo" merge-base --is-ancestor "$client" "$src"; then kind=fast-forward; else kind=rewrite; fi
+    added=$(git -C "$repo" rev-list --count "$client..$src")
+    dropped=$(git -C "$repo" rev-list --count "$src..$client")
+  fi
+  if git -C "$repo" rev-parse -q --verify "refs/heads/$source" >/dev/null; then
+    local_only=$(git -C "$repo" rev-list --count "$src..refs/heads/$source")
+  fi
+
+  if [[ "$dry" == true ]]; then
+    printf 'plan\t%s\t%s\t%s\n' "$kind" "$added" "$dropped"
+    if [[ -n "$client" && "$kind" != same ]]; then
+      git -C "$repo" log --format='new%x09%h %s' -n 20 "$client..$src"
+      git -C "$repo" log --format='drop%x09%h %s' -n 20 "$src..$client"
+    fi
+    printf 'local\t%s\n' "$local_only"
+    return 0
+  fi
+
+  if ((local_only > 0)); then echo "Note: $local_only local-only commit(s) on $source are NOT deployed (push them to origin first)."; fi
+  if [[ "$kind" == same ]]; then
+    echo "$CLIENT_REMOTE/$target is already at origin/$source (${src:0:7}); nothing to push."
+    return 0
+  fi
+  if [[ "$kind" == rewrite && "$force" != true ]]; then
+    echo "Not a fast-forward: $dropped commit(s) on $CLIENT_REMOTE/$target would be removed:" >&2
+    git -C "$repo" --no-pager log --oneline -n 20 "$src..$client" >&2
+    return 3
+  fi
+  git_batch -C "$repo" push -q --force-with-lease="refs/heads/$target:$client" "$CLIENT_REMOTE" "$src:refs/heads/$target" || {
+    echo "push rejected: $CLIENT_REMOTE/$target may have changed meanwhile; check again" >&2
+    return 1
+  }
+  if [[ "$(git_batch -C "$repo" ls-remote "$CLIENT_REMOTE" "refs/heads/$target" | cut -f1)" != "$src" ]]; then
+    echo "$CLIENT_REMOTE/$target does not match origin/$source after the push" >&2
+    return 1
+  fi
+  echo "$CLIENT_REMOTE/$target is now origin/$source ($(git -C "$repo" log -1 --format='%h %s' "$src"))$(if [[ "$kind" == rewrite ]]; then echo ", $dropped commit(s) removed"; fi)."
 }
 
 # --- Infra ------------------------------------------------------------------------
@@ -680,9 +806,13 @@ pick_services() {
 
 # --- Main ---------------------------------------------------------------------------
 # Branch commands act on the repo of the named service (nucleus, auth, ... share one repo)
-if [[ "${1:-}" =~ ^--(branches|switch|fetch|pull)$ ]]; then
-  if [[ $# -lt 2 || ("$1" == --switch && $# -lt 3) ]]; then
-    echo "Usage: ./local-up.sh $1 <service>$(if [[ "$1" == --switch ]]; then echo ' <branch>'; fi)" >&2
+if [[ "${1:-}" =~ ^--(branches|switch|fetch|pull|reset|reset-preview|client-sync)$ ]]; then
+  if [[ $# -lt 2 || ("$1" == --switch && $# -lt 3) || ("$1" == --client-sync && $# -lt 4) ]]; then
+    case "$1" in
+      --switch) echo "Usage: ./local-up.sh --switch <service> <branch>" >&2 ;;
+      --client-sync) echo "Usage: ./local-up.sh --client-sync <service> <source> <target> [--force] [--dry-run]" >&2 ;;
+      *) echo "Usage: ./local-up.sh $1 <service>" >&2 ;;
+    esac
     exit 2
   fi
   entry=$(service_entry "$2") || exit 2
@@ -703,6 +833,20 @@ if [[ "${1:-}" =~ ^--(branches|switch|fetch|pull)$ ]]; then
       fetch_repos "$dir" >/dev/null
       update_repos
       install_deps
+      ;;
+    --reset-preview) reset_preview "$dir" || exit 1 ;;
+    --reset) reset_to_origin "$entry" || exit 1 ;;
+    --client-sync)
+      force=false
+      dry=false
+      for flag in "${@:5}"; do
+        case "$flag" in
+          --force) force=true ;;
+          --dry-run) dry=true ;;
+          *) echo "Unknown option: $flag" >&2; exit 2 ;;
+        esac
+      done
+      client_sync "$dir" "$3" "$4" "$force" "$dry" || exit $?
       ;;
   esac
   exit 0

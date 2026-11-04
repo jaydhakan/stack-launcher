@@ -16,6 +16,7 @@ Start, stop and monitor your local service stack: a pick-and-run script plus a L
   - **Service controls:** tick services and press **Start selected**, or use ▶ start, ↻ restart, ■ stop and ↗ open on each row. Starts open as tabs in one terminal window.
   - **Branches:** click a row's `branch ▾` to search the repo's branches and switch, fetch or pull (switching is blocked while the repo has uncommitted changes).
   - **Dev tunnel:** with `TUNNEL_ID` set, a row shows whether the tunnel runs; click it to start or stop.
+  - **Branch picker** (click a service's branch): switch, fetch, pull, **reset to origin**, and **push to client** (`origin/main → client/client-main`, `→ client/main`, or the current branch). Each one shows what changes, including commits a force push would remove, before it runs.
   - **Updates:** it tells you when the kit has new commits; clicking that updates it.
 
 ## Install

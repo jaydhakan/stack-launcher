@@ -200,10 +200,13 @@ class BranchPicker {
     }
 
     _setButtons() {
+        if (this._view) return;
         const buttons = [
             { label: "Fetch", action: () => this._fetch() },
             { label: "Pull", action: () => this._pull() },
+            { label: "Reset to origin…", action: () => this._resetPreview() },
         ];
+        if (this._client) buttons.push({ label: "Push to client…", action: () => this._clientMenu() });
         if (this._running.length) {
             buttons.push({ label: `Restart ${this._running.length} running`, action: () => this._restart(), default: true });
         }
@@ -233,7 +236,12 @@ class BranchPicker {
             const lines = stdout.trim().split("\n").map((line) => line.split("\t"));
             const [, dir, branch, behind, ahead, uncommitted] = lines[0];
             this._repo = { dir, branch, behind: Number(behind), ahead: Number(ahead), uncommitted: Number(uncommitted) };
-            this._branches = lines.slice(1).map(([kind, name, date, mark]) => ({ kind, name, date: Number(date), current: mark === "*" }));
+            const client = lines.find(([kind]) => kind === "client");
+            this._client = client ? { remote: client[1], mainTarget: client[2] } : null;
+            this._branches = lines
+                .filter(([kind]) => kind === "local" || kind === "remote")
+                .map(([kind, name, date, mark]) => ({ kind, name, date: Number(date), current: mark === "*" }));
+            this._setButtons();
             this._title.set_text(dir);
             const parts = [`on ${paint(branch, YELLOW)}`];
             if (this._repo.behind) parts.push(paint(`↓${behind} behind origin`, ORANGE));
@@ -250,6 +258,7 @@ class BranchPicker {
     }
 
     _render() {
+        if (this._view) return;
         this._list.destroy_all_children();
         const matches = this._filtered();
         for (const b of matches.slice(0, MAX_PICKER_ROWS)) {
@@ -298,6 +307,152 @@ class BranchPicker {
             else if (/updated/.test(out)) this._changed(out);
             else this._setStatus(out, GREEN);
             this._load();
+        });
+    }
+
+    // --- Action views: replace the branch list in the same popup; Back returns to it ---
+
+    _showView(title, rows, buttons) {
+        this._view = title;
+        this._search.hide();
+        this._list.destroy_all_children();
+        const heading = new St.Label({ style: `${MONO} font-weight: bold; padding: 4px 6px;` });
+        heading.clutter_text.set_markup(title);
+        this._list.add_child(heading);
+        for (const row of rows) this._list.add_child(row);
+        this._dialog.setButtons([...buttons, { label: "Back", action: () => this._showBranches(), key: Clutter.KEY_Escape }]);
+    }
+
+    _showBranches() {
+        this._view = null;
+        this._search.show();
+        this._setButtons();
+        this._render();
+    }
+
+    _textRow(markup) {
+        const label = new St.Label({ style: `${MONO} padding: 1px 6px;` });
+        label.clutter_text.set_markup(markup);
+        label.clutter_text.line_wrap = true;
+        return label;
+    }
+
+    _choiceRow(markup, onClick) {
+        const label = new St.Label({ style: MONO, x_align: Clutter.ActorAlign.START, x_expand: true });
+        label.clutter_text.set_markup(markup);
+        const row = new St.Button({ child: label, style: PICKER_ROW, track_hover: true, x_expand: true });
+        row.connect("notify::hover", () => row.set_style(row.hover ? PICKER_ROW_HOVER : PICKER_ROW));
+        row.connect("clicked", onClick);
+        return row;
+    }
+
+    _commitRows(lines, kind, color, max = 10) {
+        const picked = lines.filter(([k]) => k === kind);
+        const rows = picked.slice(0, max).map(([, text]) => this._textRow(`  ${paint(fit(text, 80), color)}`));
+        if (picked.length > max) rows.push(this._textRow(paint(`  … and more`, GREY)));
+        return rows;
+    }
+
+    _resetPreview() {
+        if (this._busy || !this._repo) return;
+        this._setStatus("checking origin…", YELLOW);
+        this._run(["--reset-preview", this._service], (stdout, stderr, exitCode) => {
+            if (exitCode !== 0) {
+                this._setStatus(stderr || "could not check origin", RED);
+                return;
+            }
+            this._setStatus("", null);
+            const lines = stdout.trim().split("\n").map((line) => line.split("\t"));
+            const [, branch, lost, behind, uncommitted] = lines[0];
+            const title = `Reset ${esc(branch)} to origin/${esc(branch)}`;
+            if (!Number(lost) && !Number(uncommitted)) {
+                const note = Number(behind) ? `Fast-forwards ${behind} commit(s) from origin; nothing local is lost.` : "Already identical to origin.";
+                this._showView(title, [this._textRow(paint(note, GREEN))],
+                    Number(behind) ? [{ label: `Reset to origin/${branch}`, action: () => this._reset() }] : []);
+                return;
+            }
+            const rows = [this._textRow(paint("This discards, with git reset --hard:", RED))];
+            if (Number(lost)) {
+                rows.push(this._textRow(`${paint(`${lost} local commit(s) not on origin`, ORANGE)} ${paint("(still in git reflog)", GREY)}`));
+                rows.push(...this._commitRows(lines, "lost", ORANGE));
+            }
+            if (Number(uncommitted)) {
+                rows.push(this._textRow(paint(`${uncommitted} uncommitted change(s) to tracked files (gone for good)`, RED)));
+                rows.push(...this._commitRows(lines, "file", RED));
+            }
+            rows.push(this._textRow(paint("Untracked files are kept.", GREY)));
+            this._showView(title, rows, [{ label: `Discard and reset to origin/${branch}`, action: () => this._reset() }]);
+        });
+    }
+
+    _reset() {
+        if (this._busy) return;
+        this._setStatus("resetting… (installs dependencies when the lockfile changed)", YELLOW);
+        this._run(["--reset", this._service], (stdout, stderr, exitCode) => {
+            this._showBranches();
+            if (exitCode !== 0) this._setStatus(stderr || "reset failed", RED);
+            else this._changed(plain(stdout).trim());
+        });
+    }
+
+    _clientMenu() {
+        if (this._busy || !this._client) return;
+        const { remote, mainTarget } = this._client;
+        const branch = this._repo.branch;
+        const choices = [["main", mainTarget], ["main", "main"]];
+        if (branch !== "main") choices.push([branch, branch]);
+        const rows = choices.map(([source, target]) =>
+            this._choiceRow(`  origin/${esc(source)}  →  ${paint(`${remote}/${target}`, YELLOW)}`, () => this._clientPlan(source, target)));
+        rows.push(this._textRow(paint("Always pushes origin's commit, never local work. Removing client commits needs a separate confirm.", GREY)));
+        this._setStatus("", null);
+        this._showView(`Push to ${esc(remote)}`, rows, []);
+    }
+
+    _clientPlan(source, target) {
+        if (this._busy) return;
+        const { remote } = this._client;
+        this._setStatus(`checking ${remote}/${target}…`, YELLOW);
+        this._run(["--client-sync", this._service, source, target, "--dry-run"], (stdout, stderr, exitCode) => {
+            if (exitCode !== 0) {
+                this._setStatus(stderr || "could not check the client remote", RED);
+                return;
+            }
+            this._setStatus("", null);
+            const lines = stdout.trim().split("\n").map((line) => line.split("\t"));
+            const [, kind, added, dropped] = lines[0];
+            const localOnly = Number((lines.find(([k]) => k === "local") || [])[1] || 0);
+            const title = `origin/${esc(source)} → ${esc(remote)}/${esc(target)}`;
+            const rows = [];
+            const buttons = [];
+            if (kind === "same") {
+                rows.push(this._textRow(paint("Already up to date, nothing to push.", GREEN)));
+            } else if (kind === "create") {
+                rows.push(this._textRow(paint(`Creates ${remote}/${target} at origin/${source}.`, GREEN)));
+                buttons.push({ label: "Push", action: () => this._clientPush(source, target, false) });
+            } else {
+                if (Number(added)) rows.push(this._textRow(paint(`Adds ${added} commit(s):`, GREEN)), ...this._commitRows(lines, "new", GREEN, 8));
+                if (kind === "rewrite") {
+                    rows.push(this._textRow(paint(`Not a fast-forward: force push REMOVES ${dropped} commit(s) from ${remote}/${target}:`, RED)));
+                    rows.push(...this._commitRows(lines, "drop", RED, 8));
+                    buttons.push({ label: `Force push (removes ${dropped})`, action: () => this._clientPush(source, target, true) });
+                } else {
+                    buttons.push({ label: "Push", action: () => this._clientPush(source, target, false) });
+                }
+            }
+            if (localOnly) rows.push(this._textRow(paint(`${localOnly} local-only commit(s) on ${source} are not included: push them to origin first.`, ORANGE)));
+            this._showView(title, rows, [...buttons, { label: "Other target", action: () => this._clientMenu() }]);
+        });
+    }
+
+    _clientPush(source, target, force) {
+        if (this._busy) return;
+        const args = ["--client-sync", this._service, source, target];
+        if (force) args.push("--force");
+        this._setStatus(`${force ? "force " : ""}pushing origin/${source} to ${this._client.remote}/${target}…`, YELLOW);
+        this._run(args, (stdout, stderr, exitCode) => {
+            if (exitCode === 0) this._setStatus(plain(stdout).trim(), GREEN);
+            else this._setStatus(stderr || "push failed", RED);
+            if (exitCode === 0) this._clientMenu();
         });
     }
 

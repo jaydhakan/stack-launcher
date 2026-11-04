@@ -29,6 +29,12 @@
 - **The dev tunnel** listens on no local port, so it is found by process (`^devtunnel host <id>`, anchored so the tab's `bash -c` wrapper never matches) in both `local-up.sh` and `stats.py`. No `TUNNEL_ID` = no tunnel row.
 - **Memory = resident − shared** (`/proc/<pid>/statm`), not RSS. RSS counts Chrome's shared pages once per process (20 GB "used" on a 15 GB box), and exact PSS via `smaps_rollup` takes ~3 s for all processes, too slow for a live view.
 
+- **Reset to origin and Push to client** (branch picker views, `--reset[-preview]`, `--client-sync`).
+  - Both always show what changes before acting: commits lost, files discarded, commits added or removed on the client.
+  - `--reset` is `reset --hard origin/<checked-out branch>`. Local commits stay in the reflog; untracked files are kept.
+  - `--client-sync` deploys **origin's** commit of a branch, never local work, to `CLIENT_REMOTE` (only repos that have that remote). It refuses a non-fast-forward with exit 3 unless `--force`, and pushes with `--force-with-lease` pinned to the inspected commit. `--dry-run` prints `plan/new/drop/local` lines.
+  - Never make force the default: the client's `client-main` carries its own deploy commits.
+
 ## Cinnamon applet gotchas
 - **The applet must run on Cinnamon 5.x (Mint 21) and 6.x (Mint 22).** The team uses both.
   - Cinnamon's `Params.parse` throws on any unknown option, so a 6.x-only option breaks 5.x (`Unrecognized parameter`). Example: `ModalDialog({ destroyOnClose })`.

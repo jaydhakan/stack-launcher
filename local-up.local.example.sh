@@ -45,3 +45,8 @@
 # SERVICES=(
 #   "name|repo-folder|PORT_KEY:default|/url-path|infra,needed|command"
 # )
+
+# "Push to client" deploys origin branches to this remote (only repos that have it); main is
+# deployed as CLIENT_MAIN_BRANCH there
+# CLIENT_REMOTE=client
+# CLIENT_MAIN_BRANCH=client-main
