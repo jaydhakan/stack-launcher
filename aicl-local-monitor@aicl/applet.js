@@ -184,11 +184,17 @@ class AiclLocalMonitorApplet extends Applet.TextApplet {
     // --- Self-update -----------------------------------------------------------
 
     _checkForUpdate() {
-        const script = 'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" timeout 30 git fetch -q origin && echo "$(git rev-list --count HEAD..@{u}) $(git rev-parse --short HEAD)"';
+        const script = 'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" timeout 30 git fetch -q origin && ' +
+            'echo "$(git rev-list --count HEAD..@{u}) $(git rev-parse --short HEAD) $(git status --porcelain --untracked-files=no | wc -l)"';
         Util.spawnCommandLineAsyncIO("", (stdout, stderr, exitCode) => {
-            const [behind, head] = (stdout || "").trim().split(" ");
+            const [behind, head, edited] = (stdout || "").trim().split(" ");
             if (exitCode !== 0 || !head) {
                 this._updateItem.label.set_text("⟳  Update stack-launcher (could not reach GitHub)");
+            } else if (Number(edited) > 0) {
+                // Edited tracked files make `pull --ff-only` fail, and pushed they change everyone's setup
+                this._updateItem.label.clutter_text.set_markup(
+                    ` ${paint("⚠  stack-launcher has local edits: move them to local-up.local.sh", ORANGE)}`
+                );
             } else if (Number(behind) > 0) {
                 this._updateItem.label.clutter_text.set_markup(
                     ` ${paint(`⟳  Update stack-launcher (${behind} new commit${behind === "1" ? "" : "s"})`, ORANGE)}`

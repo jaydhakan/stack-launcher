@@ -41,22 +41,24 @@ EXIT_DIR="$LOG_DIR/exit"
 READY_TIMEOUT="${READY_TIMEOUT:-240}"
 
 # name | directory (relative to ROOT) | port | URL path | infra it needs | command
-# Vite ports are pinned with --strictPort so they no longer depend on start order.
+# Port `KEY:default` = KEY from the repo's own .env (the port the app will really use), else
+# the app's built-in default; a plain number is fixed. {port} in a command is replaced with
+# the resolved port (Vite ports are pinned with --strictPort, so start order never shifts them).
 SERVICES=(
-  "nucleus|aicl-monorepo-node-api-server|5100|/nucleus|postgres,kafka|npx nx serve nucleus"
-  "auth|aicl-monorepo-node-api-server|3000|/auth|postgres,kafka|npx nx serve auth"
-  "notification|aicl-monorepo-node-api-server|5700|/notification|postgres,kafka|npx nx serve notification"
-  "payment-manager|aicl-monorepo-node-api-server|3600|/payment-manager|postgres,kafka|npx nx serve payment-manager"
-  "agrisphere-api|aicl-monorepo-node-api-server|3800|/agrisphere|postgres,kafka|npx nx serve agrisphere"
-  "auditor|aicl-monorepo-node-api-server|3300|/auditor|postgres,kafka|npx nx serve auditor"
-  "responseHub|aicollect-python-api-server|9999|/response-hub|mongo,redis,kafka|uv run python -m apps.responseHub"
-  "catalyst|aicollect-python-api-server|30521|/catalyst|mongo,redis,kafka|uv run python -m apps.catalyst"
-  "form-builder-api|aicl-api-node-form-builder|3001|/frmbld|postgres,mongo|npm run dev"
-  "client|aicl-web-react-client|5173|||npm run dev -- --port 5173 --strictPort"
-  "agrisphere-ui|aicl-web-react-agrisphere|5174|||npm run dev -- --port 5174 --strictPort"
-  "account|aicl-web-react-account|5175|||npm run dev -- --port 5175 --strictPort"
-  "form-builder-ui|aicl-web-react-form-builder|5176|||npm run dev -- --port 5176 --strictPort"
-  "backoffice|aicl-web-react-backoffice|5177|||npm run dev -- --port 5177 --strictPort"
+  "nucleus|aicl-monorepo-node-api-server|NUCLEUS_PORT:5200|/nucleus|postgres,kafka|npx nx serve nucleus"
+  "auth|aicl-monorepo-node-api-server|AUTH_PORT:3100|/auth|postgres,kafka|npx nx serve auth"
+  "notification|aicl-monorepo-node-api-server|NOTIFICATION_PORT:5700|/notification|postgres,kafka|npx nx serve notification"
+  "payment-manager|aicl-monorepo-node-api-server|PAYMENT_MANAGER_PORT:3600|/payment-manager|postgres,kafka|npx nx serve payment-manager"
+  "agrisphere-api|aicl-monorepo-node-api-server|AGRISPHERE_PORT:3800|/agrisphere|postgres,kafka|npx nx serve agrisphere"
+  "auditor|aicl-monorepo-node-api-server|AUDITOR_PORT:3300|/auditor|postgres,kafka|npx nx serve auditor"
+  "responseHub|aicollect-python-api-server|RESPONSE_HUB_APP_PORT:30510|/response-hub|mongo,redis,kafka|uv run python -m apps.responseHub"
+  "catalyst|aicollect-python-api-server|CATALYST_APP_PORT:30521|/catalyst|mongo,redis,kafka|uv run python -m apps.catalyst"
+  "form-builder-api|aicl-api-node-form-builder|APP_PORT:3001|/frmbld|postgres,mongo|npm run dev"
+  "client|aicl-web-react-client|5173|||npm run dev -- --port {port} --strictPort"
+  "agrisphere-ui|aicl-web-react-agrisphere|5174|||npm run dev -- --port {port} --strictPort"
+  "account|aicl-web-react-account|5175|||npm run dev -- --port {port} --strictPort"
+  "form-builder-ui|aicl-web-react-form-builder|5176|||npm run dev -- --port {port} --strictPort"
+  "backoffice|aicl-web-react-backoffice|5177|||npm run dev -- --port {port} --strictPort"
 )
 
 # Unticked in the checklist until you pick them once (after that your last pick is remembered)
@@ -70,14 +72,52 @@ INFRA=(
   "kafka|9092|kafka"
 )
 
-# Per-machine changes (other repo folders, ports, infra units) go in local-up.local.sh next to
-# this script's link, never in this file, so updating the kit never conflicts with them. It
-# may redefine SERVICES, DEFAULT_OFF or INFRA as whole arrays (the applet reads it too).
+# Per-machine settings go in local-up.local.sh next to this script's link (git-ignored; see
+# local-up.local.example.sh), never in this file: the kit updates with `git pull --ff-only`,
+# so one person's edit here would conflict with, or once pushed break, everyone else's setup.
+declare -A SERVICE_PORT=() SERVICE_DIR=() INFRA_PORT=() INFRA_UNIT=() PORT_SOURCE=()
+DISABLE_IPV6=true
 LOCAL_OVERRIDES="$ROOT/local-up.local.sh"
 if [[ -f "$LOCAL_OVERRIDES" ]]; then
   # shellcheck disable=SC1090
   . "$LOCAL_OVERRIDES"
 fi
+
+env_value() { # env_value <dotenv file> <KEY> -> its value (only that key is read), empty when unset
+  [[ -f "$1" ]] || return 0
+  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=[[:space:]]*[\"']?([^\"'#[:space:]]*).*/\2/p" "$1" | tail -n 1
+}
+
+# Bakes overrides and .env ports into SERVICES/INFRA, so everything below sees plain values.
+# The applet's stats.py mirrors this order: local-up.local.sh, then the repo's .env, then the default.
+resolve_config() {
+  local i name dir port path needs cmd value
+  for i in "${!SERVICES[@]}"; do
+    IFS='|' read -r name dir port path needs cmd <<<"${SERVICES[$i]}"
+    dir=${SERVICE_DIR[$name]:-$dir}
+    if [[ -n "${SERVICE_PORT[$name]:-}" ]]; then
+      port=${SERVICE_PORT[$name]}
+      PORT_SOURCE[$name]="local-up.local.sh"
+    elif [[ "$port" == *:* ]]; then
+      value=$(env_value "$ROOT/$dir/.env" "${port%%:*}")
+      if [[ "$value" =~ ^[0-9]+$ ]]; then
+        PORT_SOURCE[$name]="${port%%:*} in .env"
+        port=$value
+      else
+        PORT_SOURCE[$name]="app default"
+        port=${port#*:}
+      fi
+    else
+      PORT_SOURCE[$name]="fixed"
+    fi
+    SERVICES[i]="$name|$dir|$port|$path|$needs|${cmd//\{port\}/$port}"
+  done
+  for i in "${!INFRA[@]}"; do
+    IFS='|' read -r name port value <<<"${INFRA[$i]}"
+    INFRA[i]="$name|${INFRA_PORT[$name]:-$port}|${INFRA_UNIT[$name]:-$value}"
+  done
+}
+resolve_config
 
 TMP_DIR="$(mktemp -d)"
 MY_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
@@ -112,13 +152,15 @@ usage() { # the header comment of this file, then the service table
   local svc name dir port path default
   sed -n '2,/^$/{/^$/q;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"
   echo
-  printf '%-18s %-6s %-8s %s\n' "SERVICE" "PORT" "DEFAULT" "REPO"
+  printf '%-18s %-6s %-8s %-32s %s\n' "SERVICE" "PORT" "DEFAULT" "REPO" "PORT FROM"
   for svc in "${SERVICES[@]}"; do
     IFS='|' read -r name dir port path _ <<<"$svc"
     default=on
     if [[ " ${DEFAULT_OFF[*]} " == *" $name "* ]]; then default=off; fi
-    printf '%-18s %-6s %-8s %s\n' "$name" "$port" "$default" "$dir"
+    printf '%-18s %-6s %-8s %-32s %s\n' "$name" "$port" "$default" "$dir" "${PORT_SOURCE[$name]}"
   done
+  echo
+  if [[ -f "$LOCAL_OVERRIDES" ]]; then echo "Machine settings: $LOCAL_OVERRIDES"; else echo "No local-up.local.sh (see local-up.local.example.sh in the kit)"; fi
 }
 
 ask() { # ask "prompt" -> answer on stdout (empty without a terminal)
@@ -508,6 +550,13 @@ for arg in "$@"; do
   esac
 done
 
+# Edits to the kit's tracked files are lost or conflict on the next update, and pushed they
+# change everyone's setup; say so before anything else happens
+KIT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+if [[ "$stop" == false ]] && [[ -n "$(git -C "$KIT_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  printf '\e[33mstack-launcher (%s) has local edits; machine-specific settings belong in %s\e[0m\n\n' "$KIT_DIR" "$LOCAL_OVERRIDES"
+fi
+
 # No names and no --all: show the checklist (falls back to everything without a terminal)
 menu=false
 if [[ ${#names[@]} -eq 0 && "$all" == false ]]; then
@@ -573,8 +622,8 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   exit 1
 fi
 
-# The Node services need IPv6 disabled locally; this resets on reboot.
-if [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" != "1" ]]; then
+# The Node services need IPv6 disabled locally; this resets on reboot (DISABLE_IPV6=false to skip).
+if [[ "$DISABLE_IPV6" == true && "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" != "1" ]]; then
   echo "Disabling IPv6 (needs sudo)..."
   sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
 fi

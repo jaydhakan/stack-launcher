@@ -46,6 +46,16 @@ It adapts the setup to your machine and tests everything.
 
 Click **Update stack-launcher** in the applet, or run `cd stack-launcher && git pull && ./install.sh --reload`.
 
-## Machine-specific changes
+## Ports, folders and other machine-specific settings
 
-If a repo folder, port or infra service name differs on your machine, **don't edit `local-up.sh`**. Updates would conflict with your edit. Instead, create `local-up.local.sh` next to the `local-up.sh` link (in the AICL root). Copy the whole `SERVICES=(...)`, `INFRA=(...)` or `DEFAULT_OFF=(...)` array into it and change what you need. Both the script and the applet read it.
+- **Ports are automatic.** Each backend's port is read from its repo's own `.env` (e.g. `NUCLEUS_PORT`); without it, the app's built-in default is used. That matches the port the app really listens on. `./local-up.sh --help` shows every port and where it came from.
+- **Anything else that differs on your machine** goes in `local-up.local.sh`, next to the `local-up.sh` link. Copy [`local-up.local.example.sh`](local-up.local.example.sh) and keep only the lines you need:
+
+  ```bash
+  SERVICE_PORT[client]=5180                       # another port
+  SERVICE_DIR[form-builder-api]=my-folder-name    # another clone folder
+  INFRA_UNIT[kafka]=confluent-kafka               # another systemd unit
+  ```
+
+  That file is git-ignored, and both the script and the applet read it.
+- **Never edit `local-up.sh` itself for your machine.** Updates (`git pull --ff-only`) would fail, and once pushed, your edit would change everyone's setup. The script and the applet both warn when the kit has local edits.

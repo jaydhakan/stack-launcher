@@ -39,32 +39,16 @@ Check and report:
 
 ## Step 3: Adapt to this machine (only via `local-up.local.sh`)
 
-`local-up.sh` sources `<root>/local-up.local.sh` right after its arrays, and the applet reads that file too. To change anything, copy the **whole** array (`SERVICES=(...)`, `INFRA=(...)` or `DEFAULT_OFF=(...)`) from the kit's `local-up.sh` into `local-up.local.sh` and edit the copy there. Put each array's closing `)` on a line of its own. If nothing differs, don't create the file.
+Most machines need nothing here: backend ports are read from each repo's own `.env`, and repo folders use the default clone names.
 
-The `SERVICES=(...)` array has one line per service: `name | repo dir | port | URL path | infra it needs | command`.
-
-1. **Repo folders:** check every `repo dir` exists under the root. If a repo has a different folder name here, change only the dir column (in `local-up.local.sh`). If a repo isn't cloned, tell the user. The script skips missing repos.
-2. **Ports:** check each one against this machine's config. Grep only these keys:
-
-   | Service | Expected | Where it comes from |
-   |---|---|---|
-   | nucleus | 5100 | `NUCLEUS_PORT` in `aicl-monorepo-node-api-server/.env` |
-   | auth | 3000 | `AUTH_PORT` in the same `.env` |
-   | notification | 5700 | `NOTIFICATION_PORT` in `.env`, else the default in `libs/config/src/lib/server.config.ts` |
-   | payment-manager | 3600 | `PAYMENT_MANAGER_PORT`, same rule |
-   | agrisphere-api | 3800 | `AGRISPHERE_PORT`, same rule |
-   | auditor | 3300 | `AUDITOR_PORT`, same rule |
-   | responseHub | 9999 | `RESPONSE_HUB_APP_PORT` in `aicollect-python-api-server/.env` |
-   | catalyst | 30521 | `CATALYST_APP_PORT` there, else the default in `libs/utils/config/catalyst.py` |
-   | form-builder-api | 3001 | `APP_PORT` in `aicl-api-node-form-builder/.env` |
-   | client, agrisphere-ui, account, form-builder-ui, backoffice | 5173 – 5177 | set by the script itself (`--port … --strictPort`). Don't change. |
-
-   If a backend port differs here, change the port column in `local-up.local.sh`, never the `.env`.
-3. **URL paths** (`/nucleus`, `/auth`, `/response-hub`, `/catalyst`, `/frmbld`, ...) only feed the "open in browser" links. Leave them alone.
-4. **Leave these as they are:**
+1. Run `./local-up.sh --help`. The table shows each service's port, its repo folder and where the port came from (`<KEY> in .env`, `app default` or `fixed`). Report the table.
+2. **Repo folders:** check every repo folder in the table exists under the root. If a repo has another folder name here, set `SERVICE_DIR[<service>]=<folder>`. If a repo isn't cloned, tell the user; the script skips missing repos.
+3. **Ports:** only if a port in the table is wrong for this machine, set `SERVICE_PORT[<service>]=<port>`. Never edit a `.env`. When checking `.env` files, grep only these keys: `NUCLEUS_PORT`, `AUTH_PORT`, `NOTIFICATION_PORT`, `PAYMENT_MANAGER_PORT`, `AGRISPHERE_PORT`, `AUDITOR_PORT` (node monorepo `.env`), `RESPONSE_HUB_APP_PORT`, `CATALYST_APP_PORT` (python `.env`) and `APP_PORT` (form-builder `.env`). The Vite UIs (client 5173 … backoffice 5177) are fixed by the script.
+4. **Infra:** if a unit name or port differs (Step 1), set `INFRA_UNIT[<name>]=...` or `INFRA_PORT[<name>]=...`. Leave `DISABLE_IPV6` at its default (`true`): the Node services need IPv6 disabled. Never turn it off to avoid the sudo prompt; only the user may decide that.
+5. Put these lines in `<root>/local-up.local.sh`, starting from the kit's `local-up.local.example.sh`. Re-run `--help` to confirm. Never change the kit's tracked files: `git -C <root>/stack-launcher status` must stay clean.
+6. **Leave these as they are:**
    - `DEFAULT_OFF`: payment-manager, agrisphere-api, auditor, catalyst and agrisphere-ui start unticked.
    - The nx one-at-a-time start: parallel `nx serve` runs in one monorepo crash with `NX Unexpected token ']'`.
-   - The IPv6-disable step: the Node services need it.
 
 ### Known quirks: report them, don't fix them
 

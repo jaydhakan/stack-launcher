@@ -110,18 +110,50 @@ def find_block(texts, pattern):
     return match
 
 
+def env_value(path, key):
+    """KEY's value in a dotenv file (only that key is read), or None."""
+    value = None
+    for line in (read_file(path) or "").splitlines():
+        match = re.match(rf"\s*(?:export\s+)?{re.escape(key)}\s*=\s*[\"']?([^\"'#\s]*)", line)
+        if match:
+            value = match.group(1)
+    return value
+
+
+def assignments(text, array):
+    """ARRAY[key]=value lines of local-up.local.sh, e.g. SERVICE_PORT[nucleus]=5200."""
+    return dict(re.findall(rf"^\s*{array}\[([\w.-]+)\]=[\"']?([^\"'\s#]*)", text, re.M))
+
+
+def resolve_port(raw, name, repo, port_overrides):
+    """Same order as local-up.sh's resolve_config: local-up.local.sh, the repo's .env, the default."""
+    if name in port_overrides:
+        return int(port_overrides[name])
+    if ":" in raw:
+        key, default = raw.split(":", 1)
+        value = env_value(f"{repo}/.env", key)
+        return int(value) if value and value.isdigit() else int(default)
+    return int(raw)
+
+
 def parse_localup(path):
     """SERVICES, INFRA and DEFAULT_OFF of local-up.sh (+ local overrides), so the applet never drifts from it."""
-    texts = [read_file(path) or "", read_file(os.path.join(os.path.dirname(path), "local-up.local.sh")) or ""]
+    root = os.path.dirname(path)
+    local = read_file(os.path.join(root, "local-up.local.sh")) or ""
+    texts = [read_file(path) or "", local]
+    service_dirs, service_ports = assignments(local, "SERVICE_DIR"), assignments(local, "SERVICE_PORT")
+    infra_ports = assignments(local, "INFRA_PORT")
     services, infra = [], []
     for block_name, target in (("SERVICES", services), ("INFRA", infra)):
         block = find_block(texts, rf"^{block_name}=\((.*?)^\)")
         for entry in re.findall(r'"([^"]+)"', block.group(1) if block else ""):
             parts = entry.split("|")
             if block_name == "SERVICES" and len(parts) >= 6:
-                target.append({"name": parts[0], "dir": parts[1], "port": int(parts[2]), "path": parts[3]})
+                name, repo_dir = parts[0], service_dirs.get(parts[0], parts[1])
+                port = resolve_port(parts[2], name, f"{root}/{repo_dir}", service_ports)
+                target.append({"name": name, "dir": repo_dir, "port": port, "path": parts[3]})
             elif block_name == "INFRA" and len(parts) >= 3:
-                target.append({"name": parts[0], "port": int(parts[1])})
+                target.append({"name": parts[0], "port": int(infra_ports.get(parts[0], parts[1]))})
     default_off = find_block(texts, r"^DEFAULT_OFF=\(([^)]*)\)")
     return services, infra, set(default_off.group(1).split()) if default_off else set()
 
