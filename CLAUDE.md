@@ -29,7 +29,11 @@
 - **The dev tunnel** listens on no local port, so it is found by process (`^devtunnel host <id>`, anchored so the tab's `bash -c` wrapper never matches) in both `local-up.sh` and `stats.py`. No `TUNNEL_ID` = no tunnel row.
 - **Memory = resident − shared** (`/proc/<pid>/statm`), not RSS. RSS counts Chrome's shared pages once per process (20 GB "used" on a 15 GB box), and exact PSS via `smaps_rollup` takes ~3 s for all processes, too slow for a live view.
 
-## Cinnamon applet gotchas (5.8)
+## Cinnamon applet gotchas
+- **The applet must run on Cinnamon 5.x (Mint 21) and 6.x (Mint 22).** The team uses both.
+  - Cinnamon's `Params.parse` throws on any unknown option, so a 6.x-only option breaks 5.x (`Unrecognized parameter`). Example: `ModalDialog({ destroyOnClose })`.
+  - Feature-detect with try/catch (see `newModalDialog`) instead of checking version numbers. On 5.x, `ModalDialog.close()` only hides, so destroy the dialog after the fade.
+  - Check new UI code against `/usr/share/cinnamon/js/ui/*.js` of the older version, and test on both if you can.
 - **Markup at index 0 of a clickable menu row's label is dropped.** Start such markup with a plain space: `` ` ${paint(...)}` ``.
 - **A menu's columns are aligned across all its items.** Put a multi-part row into one `St.BoxLayout` and `addActor(box, { span: -1, expand: true })`, or it gets pushed right.
 - **The menu must fit a 1080p screen.** Hence the compact rows (`padding: 1px`) and top memory/CPU side by side.

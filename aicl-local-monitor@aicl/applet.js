@@ -28,6 +28,7 @@ const GREY = "#8a8a8a";
 // Same file local-up.sh's checklist uses, so both always show the same selection
 const SELECTION_FILE = `${GLib.get_user_cache_dir()}/aicl-local-up.last`;
 const PENDING_TIMEOUT_MS = 300000;
+const DIALOG_FADE_MS = 400; // 5.x close() fades over 100 ms; destroy after it
 const UPDATE_CHECK_SECONDS = 3600;
 
 function esc(text) {
@@ -150,6 +151,16 @@ class ServiceItem extends PopupMenu.PopupBaseMenuItem {
     }
 }
 
+// Cinnamon 6 dialogs take destroyOnClose; 5.x (Mint 21) rejects any unknown parameter
+// ("Unrecognized parameter") -> [dialog, destroys itself on close]
+function newModalDialog() {
+    try {
+        return [new ModalDialog.ModalDialog({ destroyOnClose: true }), true];
+    } catch (e) {
+        return [new ModalDialog.ModalDialog(), false];
+    }
+}
+
 // Branch picker for the repo of one service: type to filter, click a branch (or Enter for the first
 // match) to switch. Fetch / Pull act on the whole repo, which the node services share.
 class BranchPicker {
@@ -161,7 +172,7 @@ class BranchPicker {
         this._running = [];
         this._busy = false;
 
-        this._dialog = new ModalDialog.ModalDialog({ destroyOnClose: true });
+        [this._dialog, this._destroysItself] = newModalDialog();
         const box = new St.BoxLayout({ vertical: true, style: "spacing: 8px; min-width: 620px;" });
         this._title = new St.Label({ text: service, style: "font-weight: bold; font-size: 1.15em;" });
         this._state = new St.Label({ text: "loading…", style: MONO });
@@ -196,7 +207,7 @@ class BranchPicker {
         if (this._running.length) {
             buttons.push({ label: `Restart ${this._running.length} running`, action: () => this._restart(), default: true });
         }
-        buttons.push({ label: "Close", action: () => this._dialog.close(), key: Clutter.KEY_Escape });
+        buttons.push({ label: "Close", action: () => this._close(), key: Clutter.KEY_Escape });
         this._dialog.setButtons(buttons);
     }
 
@@ -208,7 +219,8 @@ class BranchPicker {
         this._busy = true;
         Util.spawnCommandLineAsyncIO("", (stdout, stderr, exitCode) => {
             this._busy = false;
-            done(stdout, plain(stderr), exitCode);
+            // A fetch/pull can outlive the dialog; its labels are disposed by then
+            if (!this._closed) done(stdout, plain(stderr), exitCode);
         }, { argv: [this._applet._localupPath(), ...args] });
     }
 
@@ -301,7 +313,19 @@ class BranchPicker {
 
     _restart() {
         this._applet._restartServices(this._running);
+        this._close();
+    }
+
+    _close() {
+        this._closed = true;
         this._dialog.close();
+        // 5.x close() only fades out and hides; destroy once the fade is done so dialogs don't pile up
+        if (!this._destroysItself) {
+            Mainloop.timeout_add(DIALOG_FADE_MS, () => {
+                this._dialog.destroy();
+                return false;
+            });
+        }
     }
 }
 
