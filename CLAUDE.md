@@ -1,0 +1,50 @@
+# stack-launcher: rules for AI agents
+
+## Git (always)
+- **Commit to `main` only.** No other branches, tags or PR branches. Push with `git push origin main`.
+- **Never add Claude (or any AI) as co-author.** No `Co-Authored-By:` trailer, no "Generated with Claude Code" line, in commits or anywhere else. Commits carry only the repo's local git identity (Jay Dhakan).
+- Remote: `git@github.com-PR:jaydhakan/stack-launcher.git` (the `github.com-PR` SSH host alias picks the personal key). This repo is **public**: never commit secrets, `.env` values, tokens or machine-specific files.
+
+## What this is
+- **`local-up.sh`**: starts a local stack, one gnome-terminal tab per service. Inline checklist (branch, ↓behind ↑ahead, ● dirty), parallel `git fetch`, then `merge --ff-only` of each selected repo, infra check (offers `sudo systemctl start`), dependency install, port-conflict check (kill / skip / quit), tabs, live ready table. Flags: `--all --no-pull --no-watch --stop [names] --list --help`, env `READY_TIMEOUT`.
+- **`aicl-local-monitor@aicl/`**: Cinnamon panel applet. `applet.js` holds the UI. `stats.py` is the data helper (stdlib only), which prints one JSON snapshot per call, `--brief` while the menu is closed and `--full` while it's open.
+- **`install.sh`**: links (never copies) `<root>/local-up.sh` and `~/.local/share/cinnamon/applets/aicl-local-monitor@aicl` into this clone. It moves real files it would replace to `~/.cache/aicl-local-up/backup/`; a second folder with the same applet uuid would confuse Cinnamon. `--reload` calls `org.Cinnamon.ReloadXlet`.
+- **`SETUP_PROMPT.md`**: what a teammate's Claude Code follows to install, adapt and test on their machine. Keep it in step with any behaviour change.
+
+## Design decisions (keep them)
+- **One source of truth for services.** The `SERVICES` / `INFRA` / `DEFAULT_OFF` arrays in `local-up.sh`. `stats.py` parses them, and the per-machine overrides, with regexes, so the applet never keeps its own list. Keep the array syntax parseable: one quoted `"a|b|c"` entry per line, closing `)` on its own line.
+- **Per-machine changes go only in `<root>/local-up.local.sh`** (git-ignored), sourced right after the arrays and read by `stats.py` (last definition wins). Never edit tracked files per machine: the applet's self-update is `git pull --ff-only` and must never conflict.
+- **`ROOT` is the directory of the `local-up.sh` link** (the AICL root), not the clone. Always run it through the link.
+- **nx services start one at a time.** Parallel `nx serve` in one monorepo races on `.nx/workspace-data` and fails with `NX Unexpected token ']'`. Each later nx tab waits (max 5 min) for the previous one's port.
+- **nvm is sourced at the top of `local-up.sh`** when `npx` is missing, before `set -u` (nvm.sh trips it). The applet and launchers start from Cinnamon's environment, which never read `~/.bashrc`. The tabs inherit the PATH. A preflight stops with `Not found on PATH: ...` before opening tabs.
+- **Deps are stale when** `node_modules` is missing, our pull changed `package-lock.json` / `uv.lock`, or `package-lock.json` is newer than `node_modules/.package-lock.json` (npm's install stamp). After a successful install the stamp is touched, since npm skips rewriting it when nothing changed.
+- **Exit markers.** Each tab runs `cmd; echo $? > ~/.cache/aicl-local-up/exit/<name>.exit`. The applet shows a red `✗ exited (code)` and clears `starting…`. `--stop` kills the tab's whole process group, so stopped services leave no marker.
+- **Selection** lives in `~/.cache/aicl-local-up.last` and is shared by the checklist and the applet.
+- **Memory = resident − shared** (`/proc/<pid>/statm`), not RSS. RSS counts Chrome's shared pages once per process (20 GB "used" on a 15 GB box), and exact PSS via `smaps_rollup` takes ~3 s for all processes, too slow for a live view.
+
+## Cinnamon applet gotchas (5.8)
+- **Markup at index 0 of a clickable menu row's label is dropped.** Start such markup with a plain space: `` ` ${paint(...)}` ``.
+- **A menu's columns are aligned across all its items.** Put a multi-part row into one `St.BoxLayout` and `addActor(box, { span: -1, expand: true })`, or it gets pushed right.
+- **The menu must fit a 1080p screen.** Hence the compact rows (`padding: 1px`) and top memory/CPU side by side.
+- **A row that toggles without closing the menu** overrides `activate(event)` and calls `super.activate(event, true)`.
+- **Commands** run through `Util.spawnCommandLineAsyncIO("", cb, { argv })`, and anything interactive (sudo, prompts) goes into a `gnome-terminal`.
+
+## Testing (no test files; run the real thing, twice)
+- **Syntax:** `bash -n local-up.sh install.sh`, `node --check aicl-local-monitor@aicl/applet.js`, and `python3 aicl-local-monitor@aicl/stats.py --full --localup <root>/local-up.sh | python3 -m json.tool`.
+- **Dry runs:** put stub `gnome-terminal` / `npx` / `npm` scripts that echo their args first on `PATH`. Use `READY_TIMEOUT=3`. To mimic the applet's environment, use `env -i HOME=$HOME PATH=<cinnamon PATH>`.
+- **Interactive checklist:** drive it with `script -qc ./local-up.sh /dev/null`, piping keys in (`\e[B`, space, `\r`).
+- **Applet,** through DBus:
+  ```bash
+  A="imports.ui.appletManager.getRunningInstancesForUuid('aicl-local-monitor@aicl')[0]"
+  ev() { gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon --method org.Cinnamon.Eval "$1"; }
+  gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon --method org.Cinnamon.ReloadXlet aicl-local-monitor@aicl APPLET
+  ev "$A.menu.open(true); 'ok'"; sleep 4; gnome-screenshot -f /tmp/menu.png; ev "$A.menu.close(true); 'ok'"
+  ```
+  Check `~/.xsession-errors` for `Loaded applet aicl-local-monitor@aicl` and for JS errors.
+- **Shared state.** Never leave the user's selection file or exit markers changed after a test. Ask before stopping or starting their real services.
+- **Never kill with `pkill -f <pattern>`** when the pattern also appears in your own command line: it kills your own shell.
+
+## Style
+- Bash: `set -euo pipefail`. Use `if` rather than a trailing `[[ ]] && x` as a function's last line. Avoid `((x++))` from 0 under `set -e`.
+- Comments say why, not what, in 1-2 lines. Keep the comment density of the surrounding code.
+- No new dependencies: bash, coreutils, `ss`, `lsof`, git, python3 stdlib, gjs.

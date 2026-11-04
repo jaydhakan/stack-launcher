@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# per-machine overrides live next to the local-up.sh link, but never commit one here
+local-up.local.sh

@@ -1,0 +1,8 @@
+{
+  "uuid": "aicl-local-monitor@aicl",
+  "name": "AICL Local Monitor",
+  "description": "Live CPU / RAM in the panel; click for top apps, swap, disk, temperature and the AICL local stack.",
+  "icon": "utilities-system-monitor",
+  "max-instances": 1,
+  "version": "1.0"
+}

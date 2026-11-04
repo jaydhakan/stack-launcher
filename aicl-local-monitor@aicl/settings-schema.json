@@ -1,0 +1,26 @@
+{
+  "refresh-seconds": {
+    "type": "spinbutton",
+    "default": 3,
+    "min": 1,
+    "max": 60,
+    "step": 1,
+    "units": "seconds",
+    "description": "Panel refresh interval"
+  },
+  "localup-path": {
+    "type": "entry",
+    "default": "~/projects/AICL/local-up.sh",
+    "description": "Path to local-up.sh (services and ports are read from it)"
+  },
+  "show-temp": {
+    "type": "switch",
+    "default": true,
+    "description": "Show CPU temperature in the panel"
+  },
+  "show-swap": {
+    "type": "switch",
+    "default": true,
+    "description": "Show swap in the panel when it is above 25%"
+  }
+}
