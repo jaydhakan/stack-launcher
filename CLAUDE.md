@@ -31,7 +31,8 @@
 
 - **Reset to origin and Push to client** (branch picker views, `--reset[-preview]`, `--client-sync`).
   - Both always show what changes before acting: commits lost, files discarded, commits added or removed on the client.
-  - `--reset` is `reset --hard origin/<checked-out branch>`. Local commits stay in the reflog; untracked files are kept.
+  - `--reset` is `reset --hard origin/<checked-out branch>`. Untracked files are kept.
+  - Before it, local-only commits and uncommitted changes are saved under `refs/local-up/backup/<timestamp>/{head,wip}/<branch>`. Hidden refs; the timestamp comes first because branch names contain `/`. `--reset-undo` restores both, and backups are pruned after 30 days.
   - `--client-sync` deploys **origin's** commit of a branch, never local work, to `CLIENT_REMOTE` (only repos that have that remote). It refuses a non-fast-forward with exit 3 unless `--force`, and pushes with `--force-with-lease` pinned to the inspected commit. `--dry-run` prints `plan/new/drop/local` lines.
   - Never make force the default: the client's `client-main` carries its own deploy commits.
 
@@ -46,7 +47,9 @@
 - **A row that toggles without closing the menu** overrides `activate(event)` and calls `super.activate(event, true)`.
 - **Commands** run through `Util.spawnCommandLineAsyncIO("", cb, { argv })`, and anything interactive (sudo, prompts) goes into a `gnome-terminal`.
 
-## Testing (no test files; run the real thing, twice)
+## Testing
+- **Run `./tests/smoke.sh` before every push.** CI (`.github/workflows/ci.yml`) runs it plus `shellcheck -S warning` on each push to `main`, because everyone's applet updates from it. Add a check there for every new CLI path. It works in a temp root and cache with a stub terminal and npm, and never touches real repos.
+- Otherwise, run the real thing, twice:
 - **Syntax:** `bash -n local-up.sh install.sh`, `node --check aicl-local-monitor@aicl/applet.js`, and `python3 aicl-local-monitor@aicl/stats.py --full --localup <root>/local-up.sh | python3 -m json.tool`.
 - **Dry runs:** put stub `gnome-terminal` / `npx` / `npm` scripts that echo their args first on `PATH`. Use `READY_TIMEOUT=3`. To mimic the applet's environment, use `env -i HOME=$HOME PATH=<cinnamon PATH>`.
 - **Interactive checklist:** drive it with `script -qc ./local-up.sh /dev/null`, piping keys in (`\e[B`, space, `\r`).

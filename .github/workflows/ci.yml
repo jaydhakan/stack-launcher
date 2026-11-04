@@ -1,0 +1,21 @@
+name: CI
+
+# Everyone's applet updates itself from main, so a broken push reaches every machine:
+# check each push and pull request first.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Smoke tests
+        run: ./tests/smoke.sh
+      - name: ShellCheck
+        run: shellcheck -S warning local-up.sh install.sh update.sh tests/smoke.sh

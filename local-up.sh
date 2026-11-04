@@ -15,6 +15,7 @@
 #   ./local-up.sh --switch <service> <branch>  # switch that repo (refused while it has uncommitted changes)
 #   ./local-up.sh --fetch|--pull <service>     # fetch, or fetch + fast-forward (+ install if the lockfile changed)
 #   ./local-up.sh --reset <service>            # reset --hard the checked-out branch to origin (--reset-preview: what is lost)
+#   ./local-up.sh --reset-undo <service>       # bring back what the last reset discarded (kept 30 days)
 #   ./local-up.sh --client-sync <service> <source> <target> [--force] [--dry-run]
 #                                              # push origin/<source> to the client remote's <target>
 #   ./local-up.sh --list           # show available service names
@@ -384,7 +385,7 @@ uncommitted_count() { git -C "$ROOT/$1" status --porcelain --untracked-files=no 
 # Tab-separated: "repo <dir> <branch> <behind> <ahead> <uncommitted>", then one line per branch,
 # newest commit first: "local|remote <name> <epoch> [*]" (* = checked out; remote = only on origin)
 list_branches() {
-  local dir=$1 branch behind ahead name date
+  local dir=$1 branch behind ahead name date ts
   local -A is_local=()
   IFS='|' read -r branch behind ahead _ <<<"$(repo_state "$dir")"
   printf 'repo\t%s\t%s\t%s\t%s\t%s\n' "$dir" "$branch" "$behind" "$ahead" "$(uncommitted_count "$dir")"
@@ -392,6 +393,9 @@ list_branches() {
   if git -C "$ROOT/$dir" remote get-url "$CLIENT_REMOTE" >/dev/null 2>&1; then
     printf 'client\t%s\t%s\n' "$CLIENT_REMOTE" "$CLIENT_MAIN_BRANCH"
   fi
+  # Newest reset backup of the checked-out branch, for the picker's Undo
+  read -r ts _ <<<"$(latest_backup "$dir" "$branch")"
+  if [[ -n "$ts" ]]; then printf 'backup\t%s\n' "$ts"; fi
   while IFS=$'\t' read -r name date; do
     is_local[$name]=1
     printf 'local\t%s\t%s\t%s\n' "$name" "$date" "$(if [[ "$name" == "$branch" ]]; then echo '*'; fi)"
@@ -449,18 +453,82 @@ reset_preview() {
   git -C "$ROOT/$dir" status --porcelain --untracked-files=no | head -n 20 | sed 's/^/file\t/'
 }
 
-# Makes the checked-out branch exactly origin's: local-only commits (still in `git reflog`) and
-# uncommitted changes to tracked files are discarded; untracked files are kept
+# Reset backups: refs/local-up/backup/<timestamp>/{head,wip}/<branch>. Hidden refs, so they never
+# show in branch lists or get pushed; the timestamp comes first because branch names contain "/".
+BACKUP_REFS="refs/local-up/backup"
+BACKUP_KEEP_DAYS=30
+
+# latest_backup <dir> <branch> -> "<timestamp> <head sha> [<wip sha>]" of the newest backup, or nothing
+latest_backup() {
+  local ref ts kind name sha head="" wip="" latest=""
+  while read -r sha ref; do
+    ref=${ref#"$BACKUP_REFS"/}
+    ts=${ref%%/*}
+    ref=${ref#*/}
+    kind=${ref%%/*}
+    name=${ref#*/}
+    [[ "$name" == "$2" ]] || continue
+    if [[ "$ts" > "$latest" ]]; then latest=$ts head="" wip=""; fi
+    if [[ "$ts" == "$latest" ]]; then
+      if [[ "$kind" == head ]]; then head=$sha; else wip=$sha; fi
+    fi
+  done < <(git -C "$ROOT/$1" for-each-ref --format='%(objectname) %(refname)' "$BACKUP_REFS")
+  if [[ -n "$head" ]]; then echo "$latest $head $wip"; fi
+}
+
+prune_backups() {
+  local cutoff sha ref ts
+  cutoff=$(date -d "-$BACKUP_KEEP_DAYS days" +%Y%m%d-%H%M%S)
+  while read -r sha ref; do
+    ts=${ref#"$BACKUP_REFS"/}
+    ts=${ts%%/*}
+    if [[ "$ts" < "$cutoff" ]]; then git -C "$ROOT/$1" update-ref -d "$ref" "$sha"; fi
+  done < <(git -C "$ROOT/$1" for-each-ref --format='%(objectname) %(refname)' "$BACKUP_REFS")
+}
+
+# Puts back what the newest reset of the checked-out branch discarded: its commits, then its
+# uncommitted changes. Refused while the tree has changes of its own (they would be mixed in).
+reset_undo() {
+  local dir=$1 branch ts head wip
+  branch=$(git -C "$ROOT/$dir" branch --show-current)
+  [[ -n "$branch" ]] || { echo "$dir: HEAD is detached; check out a branch first" >&2; return 1; }
+  read -r ts head wip <<<"$(latest_backup "$dir" "$branch")"
+  [[ -n "$head" ]] || { echo "$dir: no reset backup for $branch" >&2; return 1; }
+  if (($(uncommitted_count "$dir") > 0)); then
+    echo "$dir has uncommitted changes; commit or stash them before undoing the reset" >&2
+    return 1
+  fi
+  git -C "$ROOT/$dir" reset -q --hard "$head"
+  if [[ -n "$wip" ]] && ! git -C "$ROOT/$dir" stash apply -q "$wip" >/dev/null 2>&1; then
+    echo "$dir: commits restored, but the uncommitted changes did not apply cleanly; kept as $BACKUP_REFS/$ts/wip/$branch" >&2
+    return 1
+  fi
+  git -C "$ROOT/$dir" update-ref -d "$BACKUP_REFS/$ts/head/$branch"
+  if [[ -n "$wip" ]]; then git -C "$ROOT/$dir" update-ref -d "$BACKUP_REFS/$ts/wip/$branch"; fi
+  echo "$dir: undid the reset of $branch from $ts ($(git -C "$ROOT/$dir" log -1 --format='%h %s')$(if [[ -n "$wip" ]]; then echo ', uncommitted changes restored'; fi))"
+}
+
+# Makes the checked-out branch exactly origin's: local-only commits and uncommitted changes to
+# tracked files are discarded (backed up first, see reset_undo); untracked files are kept
 reset_to_origin() {
-  local entry=$1 dir before
+  local entry=$1 dir before ts wip
   IFS='|' read -r _ dir _ <<<"$entry"
   local branch
   branch=$(git -C "$ROOT/$dir" branch --show-current)
   [[ -n "$branch" ]] || { echo "$dir: HEAD is detached; check out a branch first" >&2; return 1; }
   fetch_branch "$dir" "$branch" || return 1
   before=$(git -C "$ROOT/$dir" rev-parse HEAD)
+  # Backup first, so --reset-undo can bring back local commits AND uncommitted changes
+  wip=$(git -C "$ROOT/$dir" stash create "local-up: uncommitted changes before reset of $branch")
+  if [[ -n "$wip" ]] || (($(git -C "$ROOT/$dir" rev-list --count "origin/$branch..HEAD") > 0)); then
+    ts=$(date +%Y%m%d-%H%M%S)
+    git -C "$ROOT/$dir" update-ref "$BACKUP_REFS/$ts/head/$branch" "$before"
+    if [[ -n "$wip" ]]; then git -C "$ROOT/$dir" update-ref "$BACKUP_REFS/$ts/wip/$branch" "$wip"; fi
+  fi
+  prune_backups "$dir"
   git -C "$ROOT/$dir" reset -q --hard "origin/$branch"
   echo "$dir: reset $branch to origin/$branch ($(git -C "$ROOT/$dir" log -1 --format='%h %s'))"
+  if [[ -n "${ts:-}" ]]; then echo "Backup kept: undo with --reset-undo (or Undo in the branch picker)"; fi
   if ! git -C "$ROOT/$dir" diff --quiet "$before" HEAD -- package-lock.json uv.lock; then lock_changed[$dir]=1; fi
   selected=("$entry")
   install_deps
@@ -806,7 +874,7 @@ pick_services() {
 
 # --- Main ---------------------------------------------------------------------------
 # Branch commands act on the repo of the named service (nucleus, auth, ... share one repo)
-if [[ "${1:-}" =~ ^--(branches|switch|fetch|pull|reset|reset-preview|client-sync)$ ]]; then
+if [[ "${1:-}" =~ ^--(branches|switch|fetch|pull|reset|reset-preview|reset-undo|client-sync)$ ]]; then
   if [[ $# -lt 2 || ("$1" == --switch && $# -lt 3) || ("$1" == --client-sync && $# -lt 4) ]]; then
     case "$1" in
       --switch) echo "Usage: ./local-up.sh --switch <service> <branch>" >&2 ;;
@@ -836,6 +904,7 @@ if [[ "${1:-}" =~ ^--(branches|switch|fetch|pull|reset|reset-preview|client-sync
       ;;
     --reset-preview) reset_preview "$dir" || exit 1 ;;
     --reset) reset_to_origin "$entry" || exit 1 ;;
+    --reset-undo) reset_undo "$dir" || exit 1 ;;
     --client-sync)
       force=false
       dry=false

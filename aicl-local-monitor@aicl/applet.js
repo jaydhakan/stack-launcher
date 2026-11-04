@@ -77,6 +77,13 @@ function ago(epoch) {
     return days < 14 ? `${days}d ago` : `${Math.floor(days / 7)}w ago`;
 }
 
+// Reset backup timestamp YYYYmmdd-HHMMSS -> "14:05" today, else "3d ago"
+function backupAge(ts) {
+    const at = new Date(+ts.slice(0, 4), +ts.slice(4, 6) - 1, +ts.slice(6, 8), +ts.slice(9, 11), +ts.slice(11, 13));
+    const when = ago(at.getTime() / 1000);
+    return when === "today" ? ts.slice(9, 11) + ":" + ts.slice(11, 13) : when;
+}
+
 // local-up.sh colours its terminal output; the branch picker shows it as plain text
 function plain(text) {
     return text.replace(/\x1b\[[0-9;]*m/g, "").replace(/[ \t]+/g, " ").trim();
@@ -155,7 +162,7 @@ class ServiceItem extends PopupMenu.PopupBaseMenuItem {
 // ("Unrecognized parameter") -> [dialog, destroys itself on close]
 function newModalDialog() {
     try {
-        return [new ModalDialog.ModalDialog({ destroyOnClose: true }), true];
+        return [new ModalDialog.ModalDialog({ destroyOnClose: true }), true]; // cinnamon6-only, 5.x falls to the catch
     } catch (e) {
         return [new ModalDialog.ModalDialog(), false];
     }
@@ -206,6 +213,7 @@ class BranchPicker {
             { label: "Pull", action: () => this._pull() },
             { label: "Reset to origin…", action: () => this._resetPreview() },
         ];
+        if (this._backup) buttons.push({ label: `Undo reset (${backupAge(this._backup)})`, action: () => this._undoReset() });
         if (this._client) buttons.push({ label: "Push to client…", action: () => this._clientMenu() });
         if (this._running.length) {
             buttons.push({ label: `Restart ${this._running.length} running`, action: () => this._restart(), default: true });
@@ -238,6 +246,8 @@ class BranchPicker {
             this._repo = { dir, branch, behind: Number(behind), ahead: Number(ahead), uncommitted: Number(uncommitted) };
             const client = lines.find(([kind]) => kind === "client");
             this._client = client ? { remote: client[1], mainTarget: client[2] } : null;
+            const backup = lines.find(([kind]) => kind === "backup");
+            this._backup = backup ? backup[1] : null;
             this._branches = lines
                 .filter(([kind]) => kind === "local" || kind === "remote")
                 .map(([kind, name, date, mark]) => ({ kind, name, date: Number(date), current: mark === "*" }));
@@ -373,14 +383,14 @@ class BranchPicker {
             }
             const rows = [this._textRow(paint("This discards, with git reset --hard:", RED))];
             if (Number(lost)) {
-                rows.push(this._textRow(`${paint(`${lost} local commit(s) not on origin`, ORANGE)} ${paint("(still in git reflog)", GREY)}`));
+                rows.push(this._textRow(paint(`${lost} local commit(s) not on origin`, ORANGE)));
                 rows.push(...this._commitRows(lines, "lost", ORANGE));
             }
             if (Number(uncommitted)) {
-                rows.push(this._textRow(paint(`${uncommitted} uncommitted change(s) to tracked files (gone for good)`, RED)));
-                rows.push(...this._commitRows(lines, "file", RED));
+                rows.push(this._textRow(paint(`${uncommitted} uncommitted change(s) to tracked files`, ORANGE)));
+                rows.push(...this._commitRows(lines, "file", ORANGE));
             }
-            rows.push(this._textRow(paint("Untracked files are kept.", GREY)));
+            rows.push(this._textRow(paint("Both are backed up first: \"Undo reset\" brings them back (kept 30 days). Untracked files are kept.", GREY)));
             this._showView(title, rows, [{ label: `Discard and reset to origin/${branch}`, action: () => this._reset() }]);
         });
     }
@@ -391,6 +401,15 @@ class BranchPicker {
         this._run(["--reset", this._service], (stdout, stderr, exitCode) => {
             this._showBranches();
             if (exitCode !== 0) this._setStatus(stderr || "reset failed", RED);
+            else this._changed(plain(stdout).trim());
+        });
+    }
+
+    _undoReset() {
+        if (this._busy) return;
+        this._setStatus("undoing the last reset…", YELLOW);
+        this._run(["--reset-undo", this._service], (stdout, stderr, exitCode) => {
+            if (exitCode !== 0) this._setStatus(stderr || "undo failed", RED);
             else this._changed(plain(stdout).trim());
         });
     }
